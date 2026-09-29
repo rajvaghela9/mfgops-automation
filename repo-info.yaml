@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: RepoMeta
+metadata:
+  description: Repo metadata
+  name: repo-info
+spec:
+  jira_project: DEVOPS
+  owner:
+  - athena-devops-sdp
+  - athena-devops
+  protected_branches:
+  - main
