@@ -6,3 +6,7 @@ htmlcov
 *.tgz
 __pycache__
 *.pyc
+.env
+.env.*
+data
+.venv

@@ -1,1 +1,4 @@
-# Add runtime dependencies here.
+streamlit
+requests
+python-dotenv
+openai

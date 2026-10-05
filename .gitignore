@@ -5,3 +5,14 @@ htmlcov/
 .coverage
 *.xml
 *.tgz
+
+# Local secrets — never commit real values
+.env
+.env.*
+!.env.example
+
+# Runtime data: sqlite db, rule attachments, mock outbox
+data/
+
+# Local virtualenv
+.venv/

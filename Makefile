@@ -10,7 +10,7 @@ CHART_DIR   ?= $(firstword $(wildcard helm/*))
 GIT_DESCRIBE := $(shell git describe --tags --dirty 2>/dev/null)
 VERSION      ?= $(if $(GIT_DESCRIBE),$(patsubst v%,%,$(GIT_DESCRIBE)),0.0.0-$(shell git rev-parse --short HEAD))
 
-.PHONY: all lint test build show-image-version helm-package scaffold-check clean local-build local-push
+.PHONY: all lint test build run ui show-image-version helm-package scaffold-check clean local-build local-push
 
 all: lint test build
 
@@ -28,6 +28,14 @@ test:
 
 build:
 	pip install -r requirements.txt
+
+# Pipeline: poll Fusion, route, validate, close released orders. Serves /healthz.
+run:
+	python -m src.app
+
+# Streamlit UI. `python -m` keeps the repo root on sys.path so `src.*` imports work.
+ui:
+	python -m streamlit run src/ui_layer/app.py
 
 helm-package:
 	helm package $(CHART_DIR) --version $(VERSION) --app-version $(VERSION)
