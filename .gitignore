@@ -5,6 +5,7 @@ htmlcov/
 .coverage
 *.xml
 *.tgz
+*.DS_Store
 
 # Local secrets — never commit real values
 .env
