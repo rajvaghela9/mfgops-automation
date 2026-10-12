@@ -1,7 +1,8 @@
 """Sample orders used while FUSION_MODE=mock, shaped like the Infoblox Orders Backlog Report.
 
-The three DIST/FEDR/REN-11xxxxx orders are the review candidates from the dry run on
-Udit's backlog extract. Orders with MOCK in the number are invented for the demo.
+The DIST/FEDR/REN-11xxxxx orders are the review candidates from the dry run on Udit's
+backlog extract; FED-1103714 is Jennifer's clean domestic example. Orders with MOCK in the
+number are invented for the demo, several of them modelled on Jennifer's examples.
 Customer names, addresses and contacts are placeholders, not real customer data.
 """
 
@@ -14,6 +15,7 @@ SAMPLE_CONTACT = "Ship to Contact: Sample Contact  Phone Number: +1 555 010 0100
 CORD_US = ("IB-POWER-CORD-14G-US", "Power Cord, 14Gauge, United States")
 CORD_EU = ("IB-POWER-CORD-14G-EU", "Power Cord, 14Gauge, Europe")
 CORD_UK = ("IB-POWER-CORD-14G-UK", "Power Cord, 14Gauge, United Kingdom")
+CORD_CN = ("IB-POWER-CORD-14G-CN", "Power Cord, 14Gauge, China")
 
 
 def make_line(
@@ -44,7 +46,7 @@ def make_line(
 
 
 def appliance(line_number: int, sku: str, qty: int = 1) -> OrderLine:
-    """Build a hardware appliance line (item class "Hardware Base").
+    """Build a hardware appliance line (item class "Hardware Base Units").
 
     Args:
         line_number: Line number within the order.
@@ -55,7 +57,9 @@ def appliance(line_number: int, sku: str, qty: int = 1) -> OrderLine:
         An OrderLine.
     """
     model = sku.split("-HW")[0]
-    return make_line(line_number, sku, f"{model} Hardware, AC", qty, "Hardware Base")
+    return make_line(
+        line_number, sku, f"{model} Hardware, AC", qty, "Hardware Base Units"
+    )
 
 
 def power_cord(line_number: int, cord: tuple, qty: int = 1) -> OrderLine:
@@ -70,6 +74,25 @@ def power_cord(line_number: int, cord: tuple, qty: int = 1) -> OrderLine:
         An OrderLine.
     """
     return make_line(line_number, cord[0], cord[1], qty, "Power Cords")
+
+
+def power_supply(line_number: int, qty: int = 1) -> OrderLine:
+    """Build a spare power supply line (item class "Power Supply Units").
+
+    Args:
+        line_number: Line number within the order.
+        qty: Ordered quantity.
+
+    Returns:
+        An OrderLine.
+    """
+    return make_line(
+        line_number,
+        "T-PSU600-AC",
+        "FRU, Infoblox AC Power Supply Unit, 600W",
+        qty,
+        "Power Supply Units",
+    )
 
 
 def make_order(
@@ -108,6 +131,7 @@ def make_order(
         shipping_method="FedEx Ground (3-10 days)",
         shipping_instructions=SAMPLE_CONTACT,
         customer_po=f"PO-{order_no}",
+        ship_from="ARROW ELECTRONICS, INC.",
         scheduled_ship_date="2026-10-08",
         lines=lines,
     )
@@ -191,13 +215,13 @@ def get_mock_orders(sent_back_order_nos: Iterable[str] = ()) -> List[Order]:
             customer_po="",
             shipping_instructions="Deliver to dock 4",
         ),
-        # EUS country: routed to the EUS path and held until an approved EUS is linked.
+        # EUS country (like Jennifer's DIST-1102211): held until an approved EUS is linked.
         make_order(
             "DIST-MOCK-0004",
             "Distributor",
             "China",
             "CN",
-            [appliance(1, "TE-1506-HW-AC"), power_cord(2, CORD_US)],
+            [appliance(1, "TE-2306-HW-AC", 2), power_cord(2, CORD_CN, 4)],
         ),
         # Embargoed destination.
         make_order(
@@ -207,7 +231,84 @@ def get_mock_orders(sent_back_order_nos: Iterable[str] = ()) -> List[Order]:
             "IR",
             [appliance(1, "TE-1506-HW-AC"), power_cord(2, CORD_EU)],
         ),
-        # Return order: out of scope, filtered out before routing.
+        # Jennifer's clean US domestic example: 1606 x2 (4 cords), 1506 x2 (2 cords),
+        # 4 spare PSUs (4 cords) = 10 cords.
+        make_order(
+            "FED-1103714",
+            "Federal",
+            "United States",
+            "US",
+            [
+                appliance(1, "TE-1606-HW-AC", 2),
+                power_cord(2, CORD_US, 4),
+                power_supply(3, 2),
+                power_cord(4, CORD_US, 2),
+                appliance(5, "TE-1506-HW-AC", 2),
+                power_cord(6, CORD_US, 4),
+                power_supply(7, 2),
+            ],
+        ),
+        # Like Jennifer's Expernet South Korea order: a letter-of-credit order, so the AI
+        # should hold it for the reviewer.
+        make_order(
+            "DIST-MOCK-0007",
+            "Distributor",
+            "Korea, Republic of",
+            "KR",
+            [
+                appliance(1, "TE-1506-10GE-HW-AC", 2),
+                power_cord(2, CORD_EU, 2),
+                power_supply(3, 2),
+                power_cord(4, CORD_EU, 2),
+                appliance(5, "TE-1606-10GE-HW-AC", 6),
+                power_cord(6, CORD_EU, 12),
+            ],
+            bill_to_customer="EXPERNET",
+            ship_to_customer="EXPERNET",
+            shipping_instructions=(
+                "Ship to Contact: Sample Contact  Phone Number: 82-2-555-0100.  Shipping "
+                "Comments: Mixed New Order. Payment by L/C (letter of credit). Contact the "
+                "forwarder H & FRIENDS GTL by email before shipping."
+            ),
+        ),
+        # Like Jennifer's Dubai example: special instructions (blue-ink stamp, DHL account).
+        make_order(
+            "DIST-MOCK-0010",
+            "Distributor",
+            "United Arab Emirates",
+            "AE",
+            [appliance(1, "TE-906-HW-2AC"), power_cord(2, CORD_UK, 2)],
+            bill_to_customer="EXCLUSIVE NETWORKS ME",
+            ship_to_customer="EXCLUSIVE NETWORKS ME",
+            shipping_method="DHL Various Various",
+            freight_terms="Collect",
+            shipping_instructions=(
+                "Ship to Contact: Sample Contact  Phone Number: +971 4 555 0100.  Shipping "
+                "Comments: Please ship through DHL Account# 000000000 EXPRESS WORLDWIDE. "
+                "PARTIAL SHIPMENT NOT ALLOWED. Shipping/Commercial invoices must state the "
+                "ECCN, HS Code and Country of Origin."
+            ),
+        ),
+        # EUS + Special Instructions: an EUS country and a special-instructions customer.
+        make_order(
+            "DIST-MOCK-0008",
+            "Distributor",
+            "Iraq",
+            "IQ",
+            [appliance(1, "TE-1506-HW-AC"), power_cord(2, CORD_UK)],
+            bill_to_customer="EXCLUSIVE NETWORKS ME",
+            ship_to_customer="Sample Customer Baghdad",
+        ),
+        # Banned customer: can never be released, even if a reviewer approves.
+        make_order(
+            "DIST-MOCK-0009",
+            "Distributor",
+            "United States",
+            "US",
+            [appliance(1, "TE-1506-HW-AC"), power_cord(2, CORD_US)],
+            bill_to_customer="SAMPLE BANNED TRADING LLC",
+        ),
+        # Return order: out of scope, filtered out before review.
         make_order(
             "RMA-MOCK-0006",
             "RMA",
@@ -231,3 +332,123 @@ def get_mock_orders(sent_back_order_nos: Iterable[str] = ()) -> List[Order]:
         )
         for order in orders
     ]
+
+
+def get_problem_demo_orders() -> List[Order]:
+    """Return 10 invented orders that the review should reject or hold.
+
+    They are added to the real backlog report orders so the demo shows every outcome.
+    Like the report, they have no customer PO and no Arrow PO yet.
+
+    Returns:
+        The demo orders, each with a note on the expected outcome.
+    """
+    plain = {"customer_po": ""}
+    sfp = make_line(3, "IB-SFPPLUS-SR", "SFP+ 10GE SR Transceiver", 4, "Transceiver")
+    orders = [
+        # Reject, never releasable: embargoed destination.
+        make_order(
+            "DIST-DEMO-0001",
+            "Distributor",
+            "Iran",
+            "IR",
+            [appliance(1, "TE-1506-HW-AC"), power_cord(2, CORD_EU)],
+            **plain,
+        ),
+        # Reject, never releasable: banned customer.
+        make_order(
+            "DIST-DEMO-0002",
+            "Distributor",
+            "United States",
+            "US",
+            [appliance(1, "TE-1506-HW-AC"), power_cord(2, CORD_US)],
+            bill_to_customer="SAMPLE BANNED TRADING LLC",
+            **plain,
+        ),
+        # Reject: EU cords on a UK order.
+        make_order(
+            "REN-DEMO-0003",
+            "Renewal",
+            "United Kingdom",
+            "GB",
+            [appliance(1, "TE-1606-HW-AC", 2), power_cord(2, CORD_EU, 4)],
+            **plain,
+        ),
+        # Reject: two TE-1606 need 4 cords, only 2 ordered.
+        make_order(
+            "REG-DEMO-0004",
+            "Regular",
+            "United States",
+            "US",
+            [appliance(1, "TE-1606-HW-AC", 2), power_cord(2, CORD_US, 2)],
+            **plain,
+        ),
+        # Reject: SFP+ transceivers with a non-10GE appliance.
+        make_order(
+            "FED-DEMO-0005",
+            "Federal",
+            "United States",
+            "US",
+            [appliance(1, "TE-1506-HW-AC"), power_cord(2, CORD_US), sfp],
+            **plain,
+        ),
+        # Reject: no shipping method and no contact phone.
+        make_order(
+            "DIST-DEMO-0006",
+            "Distributor",
+            "Germany",
+            "DE",
+            [appliance(1, "TE-1506-HW-AC"), power_cord(2, CORD_EU)],
+            shipping_method="",
+            shipping_instructions="Deliver to dock 4",
+            **plain,
+        ),
+        # Hold: China needs an approved EUS.
+        make_order(
+            "DIST-DEMO-0007",
+            "Distributor",
+            "China",
+            "CN",
+            [appliance(1, "TE-2306-HW-AC", 2), power_cord(2, CORD_CN, 4)],
+            **plain,
+        ),
+        # Hold: Iraq needs an EUS, and this customer has special instructions.
+        make_order(
+            "DIST-DEMO-0008",
+            "Distributor",
+            "Iraq",
+            "IQ",
+            [appliance(1, "TE-1506-HW-AC"), power_cord(2, CORD_UK)],
+            bill_to_customer="EXCLUSIVE NETWORKS ME",
+            **plain,
+        ),
+        # Hold: Expernet letter-of-credit order (handled by hand for now).
+        make_order(
+            "DIST-DEMO-0009",
+            "Distributor",
+            "Korea, Republic of",
+            "KR",
+            [appliance(1, "TE-1506-10GE-HW-AC", 2), power_cord(2, CORD_EU, 2)],
+            bill_to_customer="EXPERNET",
+            ship_to_customer="EXPERNET",
+            shipping_instructions=(
+                "Ship to Contact: Sample Contact  Phone Number: 82-2-555-0100.  Payment by "
+                "L/C (letter of credit). Contact the forwarder by email before shipping."
+            ),
+            **plain,
+        ),
+        # Hold: mixed cord types on a US order (one US, one EU): check with OM.
+        make_order(
+            "REG-DEMO-0010",
+            "Regular",
+            "United States",
+            "US",
+            [
+                appliance(1, "TE-1506-HW-AC", 2),
+                power_cord(2, CORD_US),
+                power_cord(3, CORD_EU),
+            ],
+            **plain,
+        ),
+    ]
+    return orders

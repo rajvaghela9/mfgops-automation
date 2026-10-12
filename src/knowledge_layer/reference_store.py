@@ -1,6 +1,6 @@
 """Lookup lists the rules and router rely on: EUS countries, SI customers, cord maps.
 
-Edit them from the Knowledge Addition tab; adding an entry never needs a code change.
+Edit them by chatting with the Rules Assistant; adding an entry never needs a code change.
 """
 
 from typing import Dict
@@ -12,10 +12,24 @@ EUS_COUNTRIES = "eus_countries"
 SPECIAL_INSTRUCTION_COUNTRIES = "special_instruction_countries"
 SPECIAL_INSTRUCTION_CUSTOMERS = "special_instruction_customers"
 EMBARGOED_COUNTRIES = "embargoed_countries"
+BANNED_CUSTOMERS = "banned_customers"
 EXCLUDED_ORDER_TYPES = "excluded_order_types"
 POWER_CORD_RATIO = "power_cord_ratio"
 COUNTRY_CORD_REGION = "country_cord_region"
 TEN_GE_APPLIANCES = "ten_ge_appliances"
+
+# Names shown to MfgOps users.
+LIST_LABELS = {
+    EUS_COUNTRIES: "Countries that need an EUS",
+    SPECIAL_INSTRUCTION_COUNTRIES: "Countries with special instructions",
+    SPECIAL_INSTRUCTION_CUSTOMERS: "Customers with special instructions",
+    EMBARGOED_COUNTRIES: "Embargoed countries",
+    BANNED_CUSTOMERS: "Banned customers",
+    EXCLUDED_ORDER_TYPES: "Order types not checked (returns, internal)",
+    POWER_CORD_RATIO: "Power cords needed per unit",
+    COUNTRY_CORD_REGION: "Power cord type per country",
+    TEN_GE_APPLIANCES: "Appliances with 10GE ports (SFP+ allowed)",
+}
 
 CONFIRM = "seed — confirm with Jennifer"
 SEED_REFERENCE_LISTS = {
@@ -38,6 +52,13 @@ SEED_REFERENCE_LISTS = {
         "IR": ("Iran", "seed — confirm with Trade Compliance"),
         "KP": ("North Korea", "seed — confirm with Trade Compliance"),
         "SY": ("Syria", "seed — confirm with Trade Compliance"),
+    },
+    # Key is text matched inside the bill-to or ship-to customer name.
+    BANNED_CUSTOMERS: {
+        "SAMPLE BANNED TRADING": (
+            "Demo entry — replace with the real denied-party list",
+            "seed — confirm with Trade Compliance",
+        ),
     },
     EXCLUDED_ORDER_TYPES: {
         "RMA": ("Returns", "Dry run"),
@@ -68,12 +89,11 @@ SEED_REFERENCE_LISTS = {
         "BE": ("EU", CONFIRM),
         "IT": ("EU", CONFIRM),
         "ES": ("EU", CONFIRM),
+        "CN": ("CN", "Jennifer's China EUS example"),
     },
-    # Key is an appliance SKU prefix that has 10GE ports (SFP+ allowed).
-    TEN_GE_APPLIANCES: {
-        "TE-2306": ("10GE appliance", CONFIRM),
-        "TE-4106": ("10GE appliance", CONFIRM),
-    },
+    # Appliance SKU prefixes with 10GE ports whose SKU doesn't say "10GE". SKUs that
+    # contain "10GE" (e.g. TE-1506-10GE-HW-AC) are recognized automatically.
+    TEN_GE_APPLIANCES: {},
 }
 
 

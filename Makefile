@@ -29,7 +29,7 @@ test:
 build:
 	pip install -r requirements.txt
 
-# Pipeline: poll Fusion, route, validate, close released orders. Serves /healthz.
+# Service: check Fusion for orders and start the review workflow for new ones. Serves /healthz.
 run:
 	python -m src.app
 

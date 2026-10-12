@@ -12,6 +12,8 @@ class Config:
     """All settings the service needs. Build it with load_config(), never by hand."""
 
     fusion_mode: str
+    backlog_file_path: Optional[str]
+    include_demo_orders: bool
     email_mode: str
     fusion_base_url: str
     fusion_username: Optional[str]
@@ -20,6 +22,7 @@ class Config:
     fusion_client_secret: Optional[str]
     fusion_token_url: Optional[str]
     db_path: str
+    workflow_db_path: str
     attachments_dir: str
     outbox_dir: str
     poll_interval_seconds: int
@@ -67,6 +70,9 @@ def load_config() -> Config:
     load_dotenv()
     return Config(
         fusion_mode=read_setting("FUSION_MODE", "mock").lower(),
+        backlog_file_path=read_setting("BACKLOG_FILE_PATH"),
+        include_demo_orders=read_setting("INCLUDE_DEMO_ORDERS", "true").lower()
+        == "true",
         email_mode=read_setting("EMAIL_MODE", "mock").lower(),
         fusion_base_url=read_setting(
             "FUSION_BASE_URL", "https://efpv-dev1.fa.us6.oraclecloud.com"
@@ -77,6 +83,9 @@ def load_config() -> Config:
         fusion_client_secret=read_setting("FUSION_CLIENT_SECRET"),
         fusion_token_url=read_setting("FUSION_TOKEN_URL"),
         db_path=read_setting("DB_PATH", "data/mfgops.db"),
+        workflow_db_path=read_setting(
+            "WORKFLOW_DB_PATH", "data/workflow_checkpoints.db"
+        ),
         attachments_dir=read_setting("ATTACHMENTS_DIR", "data/attachments"),
         outbox_dir=read_setting("OUTBOX_DIR", "data/outbox"),
         poll_interval_seconds=int(read_setting("POLL_INTERVAL_SECONDS", "300")),

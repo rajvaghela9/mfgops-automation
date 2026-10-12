@@ -20,14 +20,17 @@ def isolated_environment(tmp_path, monkeypatch):
         The temp directory.
     """
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setenv("WORKFLOW_DB_PATH", str(tmp_path / "workflow.db"))
     monkeypatch.setenv("ATTACHMENTS_DIR", str(tmp_path / "attachments"))
     monkeypatch.setenv("OUTBOX_DIR", str(tmp_path / "outbox"))
     monkeypatch.setenv("FUSION_MODE", "mock")
     monkeypatch.setenv("EMAIL_MODE", "mock")
+    monkeypatch.setenv("INCLUDE_DEMO_ORDERS", "true")
     for name in [
         "LITELLM_BASE_URL",
         "LITELLM_API_KEY",
         "LITELLM_MODEL",
+        "BACKLOG_FILE_PATH",
         "OM_TEAM_EMAIL",
     ]:
         monkeypatch.setenv(name, "")

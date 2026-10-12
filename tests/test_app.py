@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 
 from src.app import HealthzHandler, run_pipeline_once, run_poll_loop
 from src.knowledge_layer import order_store
+from src.utils.models import OrderStatus
 
 
 def make_handler(path):
@@ -40,11 +41,11 @@ def test_poll_loop_survives_a_failing_cycle():
 
 def test_pipeline_runs_end_to_end_on_mock_data(seeded_db):
     summary = run_pipeline_once()
-    assert summary["sync"]["inserted"] == 9  # 10 mock orders minus 1 RMA
+    assert summary["sync"]["new"] == 14  # 15 mock orders minus 1 RMA
     assert summary["sync"]["excluded"] == 1
-    assert summary["validated"] == 9
-    assert not order_store.get_active_orders(["ROUTED"])
+    assert summary["reviewed"] == 14
+    assert not order_store.get_active_orders([OrderStatus.NEW.value])
 
     second = run_pipeline_once()
-    assert second["sync"]["unchanged"] == 9
-    assert second["validated"] == 0
+    assert second["sync"]["unchanged"] == 14
+    assert second["reviewed"] == 0

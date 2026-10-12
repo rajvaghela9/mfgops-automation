@@ -1,8 +1,10 @@
-"""Fetches new orders from Fusion, routes them, and stores them for validation.
+"""Fetches orders from Fusion and stores them; the review workflow takes it from there.
 
-FUSION_MODE=mock (default) reads src/utils/mock_data.py. FUSION_MODE=live will call
-Fusion Dev1 once the backlog report path and field mapping are confirmed by Fusion IT;
-until then the live fetch raises NotImplementedError saying what is missing.
+FUSION_MODE=file reads the backlog report Excel file at BACKLOG_FILE_PATH (a real export
+from Fusion), plus 10 demo problem orders unless INCLUDE_DEMO_ORDERS=false.
+FUSION_MODE=mock (default) reads src/utils/mock_data.py. FUSION_MODE=live will call Fusion
+Dev1 once the backlog report path and field mapping are confirmed by Fusion IT; until then
+the live fetch raises NotImplementedError saying what is missing.
 """
 
 import base64
@@ -10,12 +12,12 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from src.intelligence_layer.order_router import decide_route
 from src.knowledge_layer import order_store, reference_store
+from src.integration_layer.read_backlog_report import read_backlog_report
 from src.utils.config import Config, load_config
 from src.utils.logging_config import get_logger
-from src.utils.mock_data import get_mock_orders
-from src.utils.models import Order
+from src.utils.mock_data import get_mock_orders, get_problem_demo_orders
+from src.utils.models import Order, OrderStatus
 
 logger = get_logger(__name__)
 
@@ -131,7 +133,8 @@ def fetch_backlog_mock() -> List[Order]:
     Returns:
         The sample orders.
     """
-    return get_mock_orders(order_store.get_sent_back_order_nos())
+    sent_to_om = order_store.get_active_orders([OrderStatus.SENT_TO_OM.value])
+    return get_mock_orders(order.order_no for order in sent_to_om)
 
 
 def fetch_new_orders() -> List[Order]:
@@ -140,27 +143,41 @@ def fetch_new_orders() -> List[Order]:
     Returns:
         Every order currently in the backlog, before filtering or routing.
     """
-    if load_config().fusion_mode == "live":
+    config = load_config()
+    if config.fusion_mode == "live":
         return fetch_backlog_live()
+    if config.fusion_mode == "file":
+        if not config.backlog_file_path:
+            raise RuntimeError("FUSION_MODE=file needs BACKLOG_FILE_PATH in .env.")
+        orders = read_backlog_report(config.backlog_file_path)
+        return (
+            orders + get_problem_demo_orders() if config.include_demo_orders else orders
+        )
     return fetch_backlog_mock()
 
 
 def sync_orders() -> Dict[str, int]:
-    """Fetch the backlog, skip out-of-scope order types, route, and store each order.
+    """Fetch the backlog, skip out-of-scope order types, and store each order.
+
+    New and corrected orders get status NEW; the review workflow picks them up.
 
     Returns:
-        Counts by outcome: inserted, updated_in_place, unchanged, already_closed, excluded.
+        Counts by outcome: new, updated, unchanged, already_released, excluded.
     """
-    lists = reference_store.get_all_reference_lists()
-    excluded_types = lists.get(reference_store.EXCLUDED_ORDER_TYPES, {})
-    counts = {"inserted": 0, "updated_in_place": 0, "unchanged": 0, "already_closed": 0}
-    counts["excluded"] = 0
+    excluded_types = reference_store.get_reference_list(
+        reference_store.EXCLUDED_ORDER_TYPES
+    )
+    counts = {
+        "new": 0,
+        "updated": 0,
+        "unchanged": 0,
+        "already_released": 0,
+        "excluded": 0,
+    }
     for order in fetch_new_orders():
         if order.order_type.strip().upper() in excluded_types:
             counts["excluded"] += 1
             continue
-        route, reason = decide_route(order, lists)
-        order.route, order.route_reason = route.value, reason
         counts[order_store.upsert_order(order)] += 1
     logger.info("Fusion sync: %s", counts)
     return counts

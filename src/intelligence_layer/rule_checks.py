@@ -1,53 +1,55 @@
-"""Deterministic rules engine. It alone decides pass/fail; the LLM only explains.
+"""Runs the fixed (hard) rules and picks which rules apply to an order.
 
 How it works:
-1. build_order_facts() turns an order into named facts (e.g. power_cord_count_ok).
-   Adding a new kind of check that needs new data = add a fact here (code change).
-2. Rules in the database say "if the order is in <scope> and <conditions> on facts
-   are true, report <message>". Adding a rule over existing facts = no code change.
+1. build_order_facts() turns an order into named facts (e.g. cord_region_ok).
+   A new kind of check that needs new data = add a fact here (code change).
+2. Every rule has a scope (which orders it is about). Hard rules also have conditions
+   on facts and are checked here, always with the same answer. Soft rules are passed
+   to the AI judge with their guidance.
 """
 
 import re
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from src.intelligence_layer import llm_assist
 from src.intelligence_layer.order_router import get_destination_country
-from src.knowledge_layer import order_store, reference_store, rule_store
-from src.utils.logging_config import get_logger
+from src.knowledge_layer import reference_store
 from src.utils.models import (
-    AiRecommendation,
     Order,
-    OrderStatus,
+    OrderRoute,
     Rule,
-    RuleAction,
-    ValidationResult,
+    RuleFinding,
+    RuleOutcome,
+    RuleType,
+    Verdict,
 )
-
-logger = get_logger(__name__)
 
 POWER_CORD_SKU_PREFIX = "IB-POWER-CORD"
 SFP_PLUS_SKU_PREFIX = "IB-SFPPLUS"
-CORD_NEEDING_ITEM_CLASSES = {"HARDWARE BASE", "POWER SUPPLY"}
+# Fusion calls these "Hardware Base Units" and "Power Supply Units"; match on the start.
+CORD_NEEDING_ITEM_CLASSES = ("HARDWARE BASE", "POWER SUPPLY")
+APPLIANCE_ITEM_CLASS = "HARDWARE BASE"
 PHONE_PATTERN = re.compile(r"phone[^0-9+]*\+?[\d][\d\s\-().]{5,}", re.IGNORECASE)
 SUPPORTED_OPERATORS = ["eq", "neq", "in", "not_in", "exists", "missing", "gt", "lt"]
 
-# Every fact a rule can use, with a description shown in the Knowledge Addition tab.
-# Keep in sync with build_order_facts (a test checks this).
+# Every fact a rule can use. Keep in sync with build_order_facts (a test checks this).
 FACT_DESCRIPTIONS = {
     "order_no": "Fusion order number",
-    "order_type": "Order type, e.g. Renewal, Distributor, Federal",
-    "route": "standard | special_instructions | eus",
+    "order_type": "Fusion order type, e.g. Renewal, Distributor, Federal",
+    "route": "Order category: " + ", ".join(route.value for route in OrderRoute),
     "ship_to_country_code": "Ship-to ISO country code",
     "end_customer_country": "End-customer ISO country code (distributor orders)",
     "destination_country": "End-customer country if set, else ship-to country",
     "bill_to_customer": "Bill-to customer name",
     "ship_to_customer": "Ship-to customer name",
+    "ship_from": "Where the order ships from",
     "shipping_method": "Shipping method / carrier",
     "fob": "FOB / incoterm",
     "freight_terms": "Freight terms",
     "customer_po": "Customer PO number",
     "ship_to_phone_present": "True if shipping instructions contain a phone number",
     "is_embargoed_destination": "True if destination is on the embargoed list",
+    "is_banned_customer": "True if the bill-to or ship-to customer is on the banned list",
     "power_cord_qty": "Total power cords on the order",
     "expected_power_cord_qty": "Cords needed by appliances and PSUs (None if unknown)",
     "power_cord_count_ok": "True/False, or None when a ratio is unknown",
@@ -56,11 +58,23 @@ FACT_DESCRIPTIONS = {
     "cord_region_known": "False when there are cords but the destination is unmapped",
     "cord_region_ok": "True/False, or None when it can't be checked",
     "sfp_plus_qty": "Total SFP+ (10GE) transceivers",
-    "has_10ge_appliance": "True if any appliance has 10GE ports",
+    "has_10ge_appliance": "True if an appliance has 10GE ports ('10GE' in SKU or on the list)",
     "sfp_compatible": "False when SFP+ is ordered without a 10GE appliance",
     "documents_received": "True once OM's order mail is matched (not automated yet)",
     "eus_case_id": "Linked approved EUS case, if any",
 }
+
+# Strictest first: one rejecting finding outweighs any number of holds.
+VERDICT_STRICTNESS = [Verdict.REJECT.value, Verdict.HOLD.value, Verdict.APPROVE.value]
+
+
+@dataclass
+class RuleCheckResult:
+    """Everything the fixed checks found out about one order."""
+
+    facts: Dict[str, Any]
+    findings: List[RuleFinding] = field(default_factory=list)
+    judgement_rules: List[Rule] = field(default_factory=list)
 
 
 def match_sku_prefix(sku: str, prefixes: Dict[str, str]) -> Optional[str]:
@@ -98,7 +112,7 @@ def build_power_cord_facts(
 
     expected: Optional[int] = 0
     for line in order.lines:
-        if line.item_class.upper() not in CORD_NEEDING_ITEM_CLASSES:
+        if not line.item_class.upper().startswith(CORD_NEEDING_ITEM_CLASSES):
             continue
         ratio = match_sku_prefix(
             line.sku, lists.get(reference_store.POWER_CORD_RATIO, {})
@@ -147,10 +161,12 @@ def build_order_facts(order: Order, lists: Dict[str, Dict[str, str]]) -> Dict[st
     )
     ten_ge_list = lists.get(reference_store.TEN_GE_APPLIANCES, {})
     has_10ge = any(
-        match_sku_prefix(line.sku, ten_ge_list) is not None
+        "10GE" in line.sku.upper()
+        or match_sku_prefix(line.sku, ten_ge_list) is not None
         for line in order.lines
-        if line.item_class.upper() == "HARDWARE BASE"
+        if line.item_class.upper().startswith(APPLIANCE_ITEM_CLASS)
     )
+    customers = f"{order.bill_to_customer} {order.ship_to_customer}".upper()
     facts = {
         "order_no": order.order_no,
         "order_type": order.order_type,
@@ -160,6 +176,7 @@ def build_order_facts(order: Order, lists: Dict[str, Dict[str, str]]) -> Dict[st
         "destination_country": destination or None,
         "bill_to_customer": order.bill_to_customer,
         "ship_to_customer": order.ship_to_customer,
+        "ship_from": order.ship_from,
         "shipping_method": order.shipping_method,
         "fob": order.fob,
         "freight_terms": order.freight_terms,
@@ -171,6 +188,10 @@ def build_order_facts(order: Order, lists: Dict[str, Dict[str, str]]) -> Dict[st
             destination in lists.get(reference_store.EMBARGOED_COUNTRIES, {})
             if destination
             else None
+        ),
+        "is_banned_customer": any(
+            banned in customers
+            for banned in lists.get(reference_store.BANNED_CUSTOMERS, {})
         ),
         "sfp_plus_qty": sfp_qty,
         "has_10ge_appliance": has_10ge,
@@ -234,16 +255,18 @@ def evaluate_condition(facts: Dict[str, Any], condition: Dict[str, Any]) -> bool
 
 
 def rule_applies(facts: Dict[str, Any], rule: Rule) -> bool:
-    """Check whether an order falls inside a rule's scope.
+    """Check whether an order is one the rule is about (its category and scope).
 
     Args:
         facts: Output of build_order_facts.
-        rule: The rule; an empty scope applies to every order.
+        rule: The rule; no categories and no scope means every order.
 
     Returns:
-        True if every scope field's fact is one of its allowed values.
+        True if the rule applies to this order.
     """
-    return all(facts.get(field) in allowed for field, allowed in rule.scope.items())
+    if rule.applies_to_routes and facts.get("route") not in rule.applies_to_routes:
+        return False
+    return all(facts.get(name) in allowed for name, allowed in rule.scope.items())
 
 
 class MissingAsPlaceholder(dict):
@@ -274,15 +297,13 @@ def render_message(template: str, facts: Dict[str, Any]) -> str:
     try:
         return template.format_map(MissingAsPlaceholder(facts))
     except (ValueError, IndexError):
-        return (
-            template  # Malformed braces in a user-written message: show it as written.
-        )
+        return template  # Malformed braces in a user-written message: show as written.
 
 
-def validate_order(
+def check_order_against_rules(
     order: Order, rules: List[Rule], lists: Dict[str, Dict[str, str]]
-) -> List[ValidationResult]:
-    """Run every rule against one order.
+) -> RuleCheckResult:
+    """Run every hard rule on an order and collect the soft rules that apply to it.
 
     Args:
         order: The order (with route set).
@@ -290,62 +311,118 @@ def validate_order(
         lists: All reference lists.
 
     Returns:
-        One ValidationResult per rule that fired.
+        The order's facts, the hard-rule findings and the soft rules for the AI.
     """
     facts = build_order_facts(order, lists)
-    return [
-        ValidationResult(
-            order_no=order.order_no,
-            rule_id=rule.id,
-            rule_name=rule.name,
-            action=rule.action,
-            message=render_message(rule.message, facts),
-        )
-        for rule in rules
-        if rule_applies(facts, rule)
-        and all(evaluate_condition(facts, condition) for condition in rule.conditions)
-    ]
+    result = RuleCheckResult(facts=facts)
+    for rule in rules:
+        if not rule_applies(facts, rule):
+            continue
+        if rule.rule_type == RuleType.SOFT.value:
+            result.judgement_rules.append(rule)
+        elif all(evaluate_condition(facts, condition) for condition in rule.conditions):
+            result.findings.append(
+                RuleFinding(
+                    rule_id=rule.id,
+                    rule_name=rule.name,
+                    outcome=rule.outcome,
+                    message=render_message(rule.message or rule.description, facts),
+                    can_be_overridden=rule.can_be_overridden,
+                )
+            )
+    return result
 
 
-def recommend(findings: List[ValidationResult]) -> AiRecommendation:
-    """Turn findings into a recommendation: any block or missing document rejects.
+def stricter_verdict(first: str, second: str) -> str:
+    """Pick the stricter of two verdicts (reject beats hold beats approve).
 
     Args:
-        findings: The order's findings.
+        first: A Verdict value.
+        second: A Verdict value.
 
     Returns:
-        AiRecommendation.REJECT or AiRecommendation.APPROVE.
+        Whichever is stricter.
     """
-    rejecting = {RuleAction.BLOCK.value, RuleAction.REQUIRE_DOC.value}
-    if any(finding.action in rejecting for finding in findings):
-        return AiRecommendation.REJECT
-    return AiRecommendation.APPROVE
+    return min(first, second, key=VERDICT_STRICTNESS.index)
 
 
-def validate_pending_orders() -> int:
-    """Validate every order waiting for validation and queue it for a human.
+def verdict_from_findings(findings: List[RuleFinding]) -> str:
+    """Turn hard-rule findings into the minimum verdict they force.
 
-    Orders missing a required document go to WAITING_ON_OM; the rest to IN_REVIEW.
+    Args:
+        findings: Hard rules that found a problem.
 
     Returns:
-        How many orders were validated.
+        "reject" if any finding rejects, "hold" if any holds, else "approve".
     """
-    orders = order_store.get_active_orders([OrderStatus.ROUTED.value])
-    if not orders:
-        return 0
-    rules = rule_store.get_active_rules()
-    lists = reference_store.get_all_reference_lists()
-    for order in orders:
-        findings = validate_order(order, rules, lists)
-        waiting = any(
-            finding.action == RuleAction.REQUIRE_DOC.value for finding in findings
-        )
-        order_store.save_validation(
-            order.order_no,
-            findings,
-            recommend(findings).value,
-            llm_assist.explain_discrepancies(order, findings),
-            OrderStatus.WAITING_ON_OM.value if waiting else OrderStatus.IN_REVIEW.value,
-        )
-    logger.info("Validated %d order(s)", len(orders))
-    return len(orders)
+    verdict = Verdict.APPROVE.value
+    for finding in findings:
+        if finding.outcome == RuleOutcome.REJECT.value:
+            verdict = stricter_verdict(verdict, Verdict.REJECT.value)
+        elif finding.outcome == RuleOutcome.HOLD.value:
+            verdict = stricter_verdict(verdict, Verdict.HOLD.value)
+    return verdict
+
+
+def find_release_blocker(findings: List[RuleFinding]) -> Optional[str]:
+    """Tell whether a finding forbids release even when a reviewer approves.
+
+    Args:
+        findings: The order's hard-rule findings.
+
+    Returns:
+        The blocking finding's message (e.g. embargoed destination), or None.
+    """
+    for finding in findings:
+        if (
+            finding.outcome == RuleOutcome.REJECT.value
+            and not finding.can_be_overridden
+        ):
+            return finding.message
+    return None
+
+
+def find_rule_problems(rule: Rule) -> List[str]:
+    """Check that a rule is complete and that its checks use known facts.
+
+    Args:
+        rule: A rule about to be saved.
+
+    Returns:
+        Readable problems; an empty list means the rule is fine.
+    """
+    problems = []
+    if not rule.name.strip():
+        problems.append("The rule needs a name.")
+    if not rule.description.strip():
+        problems.append("The rule needs a plain-English description.")
+    if rule.rule_type not in [kind.value for kind in RuleType]:
+        problems.append("rule_type must be 'hard' or 'soft'.")
+    if rule.outcome not in [outcome.value for outcome in RuleOutcome]:
+        problems.append("outcome must be 'reject', 'hold' or 'warn'.")
+    for route in rule.applies_to_routes:
+        if route not in [known.value for known in OrderRoute]:
+            problems.append(f"Unknown order category {route!r}.")
+    for name in rule.scope:
+        if name not in FACT_DESCRIPTIONS:
+            problems.append(f"Unknown fact {name!r} in scope.")
+    if rule.rule_type == RuleType.HARD.value:
+        if not rule.conditions:
+            problems.append(
+                "A hard rule needs conditions; if it can't be written as a fixed "
+                "check on the known facts, make it a soft rule with guidance."
+            )
+        for condition in rule.conditions:
+            if condition.get("field") not in FACT_DESCRIPTIONS:
+                problems.append(f"Unknown fact {condition.get('field')!r}.")
+            if condition.get("op") not in SUPPORTED_OPERATORS:
+                problems.append(f"Unknown operator {condition.get('op')!r}.")
+    for placeholder in re.findall(r"\{(\w+)\}", rule.message or ""):
+        if placeholder not in FACT_DESCRIPTIONS:
+            problems.append(
+                f"The message uses {{{placeholder}}}, which isn't a known fact; use a fact "
+                "name such as {shipping_method}, or plain text."
+            )
+    if rule.rule_type == RuleType.SOFT.value and not rule.guidance.strip():
+        problems.append("A soft rule needs guidance telling the AI how to judge it.")
+    return problems

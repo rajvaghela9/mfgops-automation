@@ -1,23 +1,24 @@
-"""Stores orders while they are being worked on, plus the permanent decision log and history.
+"""Stores orders while they are being worked on, plus the permanent all-orders record.
 
-Lifecycle: an order is inserted when first fetched, updated in place when OM corrects it
-in Fusion, and deleted from the active tables once it closes (Fusion keeps the full record
-forever). A small permanent row is kept in order_history for analytics.
+Lifecycle: an order is inserted when first fetched and updated in place when OM corrects
+it in Fusion. Once released it leaves the active `orders` table, but every order ever seen
+keeps one row in `all_orders` (it feeds the Dashboard). Every reviewer decision is kept in
+`order_decisions`.
 """
 
 import hashlib
 import json
 from dataclasses import asdict
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 
 from src.knowledge_layer.db import get_connection
 from src.utils.models import (
-    AiRecommendation,
-    DecisionType,
     Order,
     OrderLine,
     OrderStatus,
-    ValidationResult,
+    ReviewerDecision,
+    RuleFinding,
+    Verdict,
 )
 from src.utils.time_helpers import utc_now_iso
 
@@ -33,11 +34,13 @@ FUSION_HEADER_FIELDS = [
     "ship_to_country",
     "ship_to_country_code",
     "end_customer_country",
+    "ship_from",
     "fob",
     "freight_terms",
     "shipping_method",
     "shipping_instructions",
     "customer_po",
+    "arrow_po",
     "scheduled_ship_date",
 ]
 LINE_FIELDS = [
@@ -53,7 +56,6 @@ LINE_FIELDS = [
     "serial_number",
     "work_order",
 ]
-REVIEWABLE_STATUSES = [OrderStatus.IN_REVIEW.value, OrderStatus.WAITING_ON_OM.value]
 
 
 def compute_content_hash(order: Order) -> str:
@@ -68,6 +70,73 @@ def compute_content_hash(order: Order) -> str:
     content = {name: getattr(order, name) for name in FUSION_HEADER_FIELDS}
     content["lines"] = [asdict(line) for line in order.lines]
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
+
+
+def is_agreement(
+    ai_verdict: Optional[str], reviewer_decision: Optional[str]
+) -> Optional[bool]:
+    """Tell whether the reviewer agreed with the AI.
+
+    Only approve/reject pairs count; a hold on either side is neither.
+
+    Args:
+        ai_verdict: A Verdict value.
+        reviewer_decision: A ReviewerDecision value.
+
+    Returns:
+        True or False, or None when either side held the order.
+    """
+    pairs = {
+        (Verdict.APPROVE.value, ReviewerDecision.APPROVE.value): True,
+        (Verdict.REJECT.value, ReviewerDecision.SEND_TO_OM.value): True,
+        (Verdict.APPROVE.value, ReviewerDecision.SEND_TO_OM.value): False,
+        (Verdict.REJECT.value, ReviewerDecision.APPROVE.value): False,
+    }
+    return pairs.get((ai_verdict, reviewer_decision))
+
+
+def copy_to_all_orders(connection, order_no: str, **release_details) -> None:
+    """Write the order's latest state into the permanent all_orders table.
+
+    Args:
+        connection: Open SQLite connection.
+        order_no: Fusion order number.
+        **release_details: Optional release_request_id and released_at.
+
+    Returns:
+        None.
+    """
+    row = connection.execute(
+        "SELECT * FROM orders WHERE order_no = ?", (order_no,)
+    ).fetchone()
+    if row is None:
+        return
+    agreed = is_agreement(row["ai_verdict"], row["reviewer_decision"])
+    values = {
+        "order_no": order_no,
+        "order_type": row["order_type"],
+        "route": row["route"],
+        "ship_to_country": row["ship_to_country"],
+        "status": row["status"],
+        "ai_verdict": row["ai_verdict"],
+        "reviewer_decision": row["reviewer_decision"],
+        "agreed": None if agreed is None else int(agreed),
+        "decided_by": row["decided_by"],
+        "reviewer_comment": row["reviewer_comment"],
+        "rework_count": row["rework_count"],
+        "first_seen_at": row["first_seen_at"],
+        "last_updated_at": row["last_updated_at"],
+        **release_details,
+    }
+    updates = ", ".join(
+        f"{name} = excluded.{name}" for name in values if name != "order_no"
+    )
+    connection.execute(
+        f"INSERT INTO all_orders ({', '.join(values)}) "
+        f"VALUES ({', '.join('?' for _ in values)}) "
+        f"ON CONFLICT(order_no) DO UPDATE SET {updates}",
+        list(values.values()),
+    )
 
 
 def insert_lines(connection, order: Order) -> None:
@@ -92,66 +161,60 @@ def insert_lines(connection, order: Order) -> None:
 def upsert_order(order: Order) -> str:
     """Insert a newly fetched order, or update it in place if OM changed it.
 
-    An updated order goes back to ROUTED so it is validated again; its old findings,
-    AI recommendation and human decision are cleared.
+    A changed order goes back to NEW so it is checked again from the start; its old
+    findings, AI verdict and reviewer decision are cleared.
 
     Args:
-        order: The fetched order, with route and route_reason already set.
+        order: The fetched order.
 
     Returns:
-        "inserted", "updated_in_place", "unchanged", or "already_closed".
+        "new", "updated", "unchanged", or "already_released".
     """
     new_hash = compute_content_hash(order)
     raw_json = order.raw_json or json.dumps(asdict(order), default=str)
     now = utc_now_iso()
     header_values = [getattr(order, name) for name in FUSION_HEADER_FIELDS]
     with get_connection() as connection:
-        if connection.execute(
-            "SELECT 1 FROM order_history WHERE order_no = ?", (order.order_no,)
-        ).fetchone():
-            return "already_closed"
+        released = connection.execute(
+            "SELECT 1 FROM all_orders WHERE order_no = ? AND status = ?",
+            (order.order_no, OrderStatus.RELEASED.value),
+        ).fetchone()
+        if released:
+            return "already_released"
         existing = connection.execute(
-            "SELECT content_hash, status FROM orders WHERE order_no = ?",
-            (order.order_no,),
+            "SELECT content_hash FROM orders WHERE order_no = ?", (order.order_no,)
         ).fetchone()
 
         if existing is None:
-            columns = [
-                "order_no",
-                *FUSION_HEADER_FIELDS,
-                "documents_received",
-                "eus_case_id",
-            ]
-            columns += ["route", "route_reason", "status", "content_hash", "raw_json"]
+            columns = ["order_no", *FUSION_HEADER_FIELDS, "documents_received"]
+            columns += ["eus_case_id", "status", "content_hash", "raw_json"]
             columns += ["first_seen_at", "last_updated_at"]
             values = [order.order_no, *header_values, int(order.documents_received)]
-            values += [order.eus_case_id, order.route, order.route_reason]
-            values += [OrderStatus.ROUTED.value, new_hash, raw_json, now, now]
+            values += [order.eus_case_id, OrderStatus.NEW.value, new_hash, raw_json]
+            values += [now, now]
             connection.execute(
                 f"INSERT INTO orders ({', '.join(columns)}) "
                 f"VALUES ({', '.join('?' for _ in columns)})",
                 values,
             )
             insert_lines(connection, order)
-            return "inserted"
+            copy_to_all_orders(connection, order.order_no)
+            return "new"
 
-        # A released order is Fusion's to finish; don't pull it back into review.
-        if existing["content_hash"] == new_hash or existing["status"] == (
-            OrderStatus.AWAITING_USPO.value
-        ):
+        if existing["content_hash"] == new_hash:
             return "unchanged"
 
         assignments = ", ".join(f"{name} = ?" for name in FUSION_HEADER_FIELDS)
         connection.execute(
-            f"UPDATE orders SET {assignments}, route = ?, route_reason = ?, status = ?, "
-            "ai_recommendation = NULL, ai_explanation = NULL, human_decision = NULL, "
+            f"UPDATE orders SET {assignments}, status = ?, route = NULL, "
+            "route_reason = NULL, ai_verdict = NULL, ai_used = NULL, ai_summary = NULL, "
+            "ai_reasons_json = NULL, reviewer_decision = NULL, reviewer_comment = NULL, "
+            "decided_by = NULL, review_thread_id = NULL, "
             "rework_count = rework_count + 1, content_hash = ?, raw_json = ?, "
             "last_updated_at = ? WHERE order_no = ?",
             (
                 *header_values,
-                order.route,
-                order.route_reason,
-                OrderStatus.ROUTED.value,
+                OrderStatus.NEW.value,
                 new_hash,
                 raw_json,
                 now,
@@ -162,10 +225,11 @@ def upsert_order(order: Order) -> str:
             "DELETE FROM order_lines WHERE order_no = ?", (order.order_no,)
         )
         connection.execute(
-            "DELETE FROM validation_results WHERE order_no = ?", (order.order_no,)
+            "DELETE FROM rule_findings WHERE order_no = ?", (order.order_no,)
         )
         insert_lines(connection, order)
-        return "updated_in_place"
+        copy_to_all_orders(connection, order.order_no)
+        return "updated"
 
 
 def row_to_order(row, line_rows) -> Order:
@@ -185,6 +249,8 @@ def row_to_order(row, line_rows) -> Order:
         name: row[name] for name in row.keys() if name in Order.__dataclass_fields__
     }
     data["documents_received"] = bool(data.get("documents_received"))
+    data["ai_reasons"] = json.loads(row["ai_reasons_json"] or "[]")
+    data["ai_used"] = row["ai_used"] != 0  # not reviewed yet (None) counts as fine
     return Order(**data, lines=lines)
 
 
@@ -195,7 +261,7 @@ def get_order(order_no: str) -> Optional[Order]:
         order_no: Fusion order number.
 
     Returns:
-        The Order, or None if it isn't active (never seen, or already closed).
+        The Order, or None if it isn't active (never seen, or already released).
     """
     with get_connection() as connection:
         row = connection.execute(
@@ -219,8 +285,7 @@ def get_active_orders(statuses: Optional[List[str]] = None) -> List[Order]:
     Returns:
         Orders (with lines), oldest first.
     """
-    query = "SELECT order_no FROM orders"
-    params: tuple = ()
+    query, params = "SELECT order_no FROM orders", ()
     if statuses:
         query += f" WHERE status IN ({', '.join('?' for _ in statuses)})"
         params = tuple(statuses)
@@ -232,167 +297,125 @@ def get_active_orders(statuses: Optional[List[str]] = None) -> List[Order]:
     return [order for order in map(get_order, order_nos) if order is not None]
 
 
-def get_sent_back_order_nos() -> Set[str]:
-    """List orders currently sent back to OM.
-
-    Returns:
-        Their order numbers.
-    """
-    with get_connection() as connection:
-        rows = connection.execute(
-            "SELECT order_no FROM orders WHERE status = ?",
-            (OrderStatus.SENT_BACK_TO_OM.value,),
-        ).fetchall()
-    return {row["order_no"] for row in rows}
-
-
-def update_order_status(order_no: str, status: str) -> None:
-    """Move an order to a new status.
+def update_order(order_no: str, **changes) -> None:
+    """Change some workflow fields of an active order and refresh its all_orders row.
 
     Args:
         order_no: Fusion order number.
-        status: An OrderStatus value.
+        **changes: Column name to new value, e.g. status="ON_HOLD".
 
     Returns:
         None.
     """
+    if "ai_used" in changes:
+        changes["ai_used"] = int(changes["ai_used"])
+    if "ai_reasons" in changes:
+        changes["ai_reasons_json"] = json.dumps(changes.pop("ai_reasons"))
+    changes["last_updated_at"] = utc_now_iso()
     with get_connection() as connection:
         connection.execute(
-            "UPDATE orders SET status = ?, last_updated_at = ? WHERE order_no = ?",
-            (status, utc_now_iso(), order_no),
+            f"UPDATE orders SET {', '.join(f'{name} = ?' for name in changes)} "
+            "WHERE order_no = ?",
+            [*changes.values(), order_no],
         )
+        copy_to_all_orders(connection, order_no)
 
 
-def save_validation(
-    order_no: str,
-    findings: List[ValidationResult],
-    ai_recommendation: str,
-    ai_explanation: str,
-    status: str,
-) -> None:
-    """Replace an order's findings and store the AI recommendation and explanation.
+def save_rule_findings(order_no: str, findings: List[RuleFinding]) -> None:
+    """Replace an order's hard-rule findings.
 
     Args:
         order_no: Fusion order number.
-        findings: Rules that fired on the order.
-        ai_recommendation: An AiRecommendation value.
-        ai_explanation: Plain-language summary of the findings ("" if none).
-        status: Status to move to (IN_REVIEW or WAITING_ON_OM).
+        findings: Hard rules that found a problem.
 
     Returns:
         None.
     """
     now = utc_now_iso()
     with get_connection() as connection:
-        connection.execute(
-            "DELETE FROM validation_results WHERE order_no = ?", (order_no,)
-        )
+        connection.execute("DELETE FROM rule_findings WHERE order_no = ?", (order_no,))
         for finding in findings:
             connection.execute(
-                "INSERT INTO validation_results "
-                "(order_no, rule_id, rule_name, action, message, evaluated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO rule_findings (order_no, rule_id, rule_name, outcome, "
+                "message, can_be_overridden, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     order_no,
                     finding.rule_id,
                     finding.rule_name,
-                    finding.action,
+                    finding.outcome,
                     finding.message,
+                    int(finding.can_be_overridden),
                     now,
                 ),
             )
-        connection.execute(
-            "UPDATE orders SET ai_recommendation = ?, ai_explanation = ?, status = ?, "
-            "last_updated_at = ? WHERE order_no = ?",
-            (ai_recommendation, ai_explanation, status, now, order_no),
-        )
 
 
-def get_validation_results(order_no: str) -> List[ValidationResult]:
-    """Read an order's current findings.
+def get_rule_findings(order_no: str) -> List[RuleFinding]:
+    """Read an order's current hard-rule findings.
 
     Args:
         order_no: Fusion order number.
 
     Returns:
-        The findings, in the order they were evaluated.
+        The findings, in the order they were checked.
     """
     with get_connection() as connection:
         rows = connection.execute(
-            "SELECT * FROM validation_results WHERE order_no = ? ORDER BY id",
-            (order_no,),
+            "SELECT * FROM rule_findings WHERE order_no = ? ORDER BY id", (order_no,)
         ).fetchall()
     return [
-        ValidationResult(
-            order_no=row["order_no"],
+        RuleFinding(
             rule_id=row["rule_id"],
             rule_name=row["rule_name"],
-            action=row["action"],
+            outcome=row["outcome"],
             message=row["message"],
+            can_be_overridden=bool(row["can_be_overridden"]),
         )
         for row in rows
     ]
 
 
-def is_agreement(decision: str, ai_recommendation: Optional[str]) -> bool:
-    """Tell whether a human decision agrees with the AI recommendation.
-
-    Args:
-        decision: A DecisionType value.
-        ai_recommendation: An AiRecommendation value (or None).
-
-    Returns:
-        True for approve+approved and reject+sent back; False otherwise (incl. overrides).
-    """
-    return (
-        decision == DecisionType.APPROVED.value
-        and ai_recommendation == AiRecommendation.APPROVE.value
-    ) or (
-        decision == DecisionType.SENT_BACK.value
-        and ai_recommendation == AiRecommendation.REJECT.value
-    )
-
-
-def record_decision(
+def record_reviewer_decision(
     order_no: str, decision: str, decided_by: str, comment: Optional[str]
 ) -> None:
-    """Append a human decision to the permanent log and note it on the order.
+    """Note the reviewer's decision on the order and append it to the permanent log.
 
     Args:
         order_no: Fusion order number.
-        decision: A DecisionType value.
+        decision: A ReviewerDecision value.
         decided_by: Name of the MfgOps user.
-        comment: Optional comment (required by callers for overrides and send-backs).
+        comment: The reviewer's comment, if any.
 
     Returns:
         None.
     """
+    order = get_order(order_no)
+    ai_verdict = order.ai_verdict if order else None
+    agreed = is_agreement(ai_verdict, decision)
     with get_connection() as connection:
-        row = connection.execute(
-            "SELECT ai_recommendation FROM orders WHERE order_no = ?", (order_no,)
-        ).fetchone()
-        ai_recommendation = row["ai_recommendation"] if row else None
         connection.execute(
             "INSERT INTO order_decisions (order_no, decision, decided_by, comment, "
-            "ai_recommendation_at_time, agreed, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "ai_verdict_at_time, agreed, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 order_no,
                 decision,
                 decided_by,
                 comment,
-                ai_recommendation,
-                int(is_agreement(decision, ai_recommendation)),
+                ai_verdict,
+                None if agreed is None else int(agreed),
                 utc_now_iso(),
             ),
         )
-        connection.execute(
-            "UPDATE orders SET human_decision = ? WHERE order_no = ?",
-            (decision, order_no),
-        )
+    update_order(
+        order_no,
+        reviewer_decision=decision,
+        reviewer_comment=comment,
+        decided_by=decided_by,
+    )
 
 
 def mark_released(order_no: str, release_request_id: str) -> None:
-    """Record that the release job was submitted; the order now waits for its USPO.
+    """Record the release in all_orders, then remove the order from the active tables.
 
     Args:
         order_no: Fusion order number.
@@ -404,114 +427,83 @@ def mark_released(order_no: str, release_request_id: str) -> None:
     now = utc_now_iso()
     with get_connection() as connection:
         connection.execute(
-            "UPDATE orders SET status = ?, release_request_id = ?, released_at = ?, "
-            "last_updated_at = ? WHERE order_no = ?",
-            (OrderStatus.AWAITING_USPO.value, release_request_id, now, now, order_no),
+            "UPDATE orders SET status = ?, last_updated_at = ? WHERE order_no = ?",
+            (OrderStatus.RELEASED.value, now, order_no),
         )
-
-
-def close_order(order_no: str, uspo_number: str) -> None:
-    """Close an order: keep a permanent history row, then delete its working data.
-
-    Args:
-        order_no: Fusion order number.
-        uspo_number: The USPO that confirmed Arrow received the order.
-
-    Returns:
-        None.
-    """
-    with get_connection() as connection:
-        row = connection.execute(
-            "SELECT * FROM orders WHERE order_no = ?", (order_no,)
-        ).fetchone()
-        if row is None:
-            return
-        connection.execute(
-            "INSERT INTO order_history (order_no, order_type, route, first_seen_at, "
-            "released_at, uspo_number, closed_at, ai_recommendation, final_decision, agreed, "
-            "rework_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                order_no,
-                row["order_type"],
-                row["route"],
-                row["first_seen_at"],
-                row["released_at"],
-                uspo_number,
-                utc_now_iso(),
-                row["ai_recommendation"],
-                row["human_decision"],
-                int(is_agreement(row["human_decision"], row["ai_recommendation"])),
-                row["rework_count"],
-            ),
+        copy_to_all_orders(
+            connection, order_no, release_request_id=release_request_id, released_at=now
         )
         # Lines and findings go with it (ON DELETE CASCADE).
         connection.execute("DELETE FROM orders WHERE order_no = ?", (order_no,))
 
 
-def get_order_history(search: str = "") -> List[Dict]:
-    """Read closed orders, newest first.
+def get_all_orders(search: str = "") -> List[Dict]:
+    """Read every order ever seen, newest activity first.
 
     Args:
-        search: Optional text to match in the order number or USPO.
+        search: Optional text to match in the order number or country.
 
     Returns:
-        A list of dicts, one per closed order.
+        A list of dicts, one per order.
     """
     pattern = f"%{search.strip()}%"
     with get_connection() as connection:
         rows = connection.execute(
-            "SELECT * FROM order_history WHERE order_no LIKE ? OR uspo_number LIKE ? "
-            "ORDER BY closed_at DESC",
+            "SELECT * FROM all_orders WHERE order_no LIKE ? OR ship_to_country LIKE ? "
+            "ORDER BY last_updated_at DESC",
             (pattern, pattern),
         ).fetchall()
     return [dict(row) for row in rows]
 
 
-def get_order_history_metrics(minutes_saved_per_order: float) -> Dict:
-    """Compute the numbers shown on the Analytics tab.
+def get_dashboard_numbers(minutes_saved_per_order: float) -> Dict:
+    """Compute the numbers shown on the Dashboard, from the all_orders table.
 
     Args:
-        minutes_saved_per_order: Assumed manual minutes saved per closed order.
+        minutes_saved_per_order: Assumed manual minutes saved per reviewed order.
 
     Returns:
-        A dict of metrics (counts, rates, hours saved, breakdowns by route and status).
+        A dict of counts, rates, hours saved, and breakdowns by category and status.
     """
     with get_connection() as connection:
-        closed = connection.execute(
-            "SELECT COUNT(*) AS total, COALESCE(SUM(rework_count = 0), 0) AS first_pass "
-            "FROM order_history"
-        ).fetchone()
-        decisions = connection.execute(
-            "SELECT COUNT(*) AS total, COALESCE(SUM(agreed), 0) AS agreed, "
-            "COALESCE(SUM(decision = ?), 0) AS overrides, "
-            "COALESCE(SUM(decision = ?), 0) AS sent_back FROM order_decisions",
-            (DecisionType.PUSHED_OVERRIDE.value, DecisionType.SENT_BACK.value),
+        totals = connection.execute(
+            "SELECT COUNT(*) AS seen, "
+            "COALESCE(SUM(status = ?), 0) AS released, "
+            "COALESCE(SUM(status = ?), 0) AS sent_to_om, "
+            "COALESCE(SUM(status IN (?, ?)), 0) AS waiting, "
+            "COALESCE(SUM(ai_verdict IS NOT NULL), 0) AS checked_by_ai, "
+            "COUNT(agreed) AS compared, COALESCE(SUM(agreed), 0) AS agreed, "
+            "COALESCE(SUM(rework_count = 0 AND status = ?), 0) AS first_time_right "
+            "FROM all_orders",
+            (
+                OrderStatus.RELEASED.value,
+                OrderStatus.SENT_TO_OM.value,
+                OrderStatus.WAITING_FOR_REVIEW.value,
+                OrderStatus.ON_HOLD.value,
+                OrderStatus.RELEASED.value,
+            ),
         ).fetchone()
         by_route = connection.execute(
-            "SELECT route, COUNT(*) AS total FROM order_history GROUP BY route"
+            "SELECT route, COUNT(*) AS total FROM all_orders "
+            "WHERE route IS NOT NULL GROUP BY route"
         ).fetchall()
         by_status = connection.execute(
-            "SELECT status, COUNT(*) AS total FROM orders GROUP BY status"
+            "SELECT status, COUNT(*) AS total FROM all_orders GROUP BY status"
         ).fetchall()
-        cycle = connection.execute(
-            "SELECT AVG((julianday(released_at) - julianday(first_seen_at)) * 24 * 60) "
-            "AS minutes FROM order_history WHERE released_at IS NOT NULL"
-        ).fetchone()
-    closed_total = closed["total"]
-    decisions_total = decisions["total"]
     return {
-        "orders_closed": closed_total,
-        "first_pass_rate": (
-            closed["first_pass"] / closed_total if closed_total else None
-        ),
-        "decisions_total": decisions_total,
+        "orders_seen": totals["seen"],
+        "released": totals["released"],
+        "sent_to_om": totals["sent_to_om"],
+        "waiting": totals["waiting"],
         "agreement_rate": (
-            decisions["agreed"] / decisions_total if decisions_total else None
+            totals["agreed"] / totals["compared"] if totals["compared"] else None
         ),
-        "overrides": decisions["overrides"],
-        "sent_back": decisions["sent_back"],
-        "hours_saved": closed_total * minutes_saved_per_order / 60,
-        "avg_minutes_detected_to_released": cycle["minutes"],
-        "closed_by_route": {row["route"]: row["total"] for row in by_route},
-        "active_by_status": {row["status"]: row["total"] for row in by_status},
+        "first_time_right_rate": (
+            totals["first_time_right"] / totals["released"]
+            if totals["released"]
+            else None
+        ),
+        "hours_saved": totals["checked_by_ai"] * minutes_saved_per_order / 60,
+        "by_route": {row["route"]: row["total"] for row in by_route},
+        "by_status": {row["status"]: row["total"] for row in by_status},
     }

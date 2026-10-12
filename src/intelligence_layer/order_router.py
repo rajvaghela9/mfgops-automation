@@ -1,4 +1,4 @@
-"""Decides which route an order follows: Standard, Special Instructions only, or EUS.
+"""Decides an order's category: Standard, Special Instructions, EUS, or EUS + Special Instructions.
 
 Fully deterministic: it only looks up the destination and customer in reference lists.
 """
@@ -6,7 +6,7 @@ Fully deterministic: it only looks up the destination and customer in reference 
 from typing import Dict, Optional, Tuple
 
 from src.knowledge_layer import reference_store
-from src.utils.models import Order, RouteDecision
+from src.utils.models import Order, OrderRoute
 
 
 def get_destination_country(order: Order) -> str:
@@ -25,46 +25,60 @@ def get_destination_country(order: Order) -> str:
     )
 
 
+def find_special_instruction_reason(
+    order: Order, destination: str, lists: Dict[str, Dict[str, str]]
+) -> Optional[str]:
+    """Check whether the destination or customer needs special instructions.
+
+    Args:
+        order: The order.
+        destination: Its destination country code.
+        lists: All reference lists.
+
+    Returns:
+        A readable reason, or None if no special instructions apply.
+    """
+    si_countries = lists.get(reference_store.SPECIAL_INSTRUCTION_COUNTRIES, {})
+    if destination in si_countries:
+        return f"{destination} orders need special instructions ({si_countries[destination]})."
+    customers = f"{order.bill_to_customer} {order.ship_to_customer}".upper()
+    for customer_key, description in lists.get(
+        reference_store.SPECIAL_INSTRUCTION_CUSTOMERS, {}
+    ).items():
+        if customer_key in customers:
+            return f"Customer {description} has special instructions."
+    return None
+
+
 def decide_route(
     order: Order, reference_lists: Optional[Dict[str, Dict[str, str]]] = None
-) -> Tuple[RouteDecision, str]:
-    """Decide which of the three routes an order should follow.
+) -> Tuple[OrderRoute, str]:
+    """Decide which of the four categories an order belongs to.
 
     Args:
         order: The order to classify.
         reference_lists: Preloaded reference lists; loaded from the store if None.
 
     Returns:
-        A tuple of (route, human-readable reason) to store on the order.
+        A tuple of (category, human-readable reason) to store on the order.
     """
     lists = reference_lists or reference_store.get_all_reference_lists()
     destination = get_destination_country(order)
-
     eus_countries = lists.get(reference_store.EUS_COUNTRIES, {})
-    if destination in eus_countries:
-        return (
-            RouteDecision.EUS,
-            f"Destination {destination} is on the EUS country list ({eus_countries[destination]}).",
-        )
+    eus_reason = (
+        f"{destination} needs an End-Use Statement ({eus_countries[destination]})."
+        if destination in eus_countries
+        else None
+    )
+    si_reason = find_special_instruction_reason(order, destination, lists)
 
-    si_countries = lists.get(reference_store.SPECIAL_INSTRUCTION_COUNTRIES, {})
-    if destination in si_countries:
-        return (
-            RouteDecision.SPECIAL_INSTRUCTIONS,
-            f"Destination {destination} needs special instructions ({si_countries[destination]}).",
-        )
-
-    customers = f"{order.bill_to_customer} {order.ship_to_customer}".upper()
-    for customer_key, description in lists.get(
-        reference_store.SPECIAL_INSTRUCTION_CUSTOMERS, {}
-    ).items():
-        if customer_key in customers:
-            return (
-                RouteDecision.SPECIAL_INSTRUCTIONS,
-                f"Customer matches special-instructions customer {description}.",
-            )
-
+    if eus_reason and si_reason:
+        return OrderRoute.EUS_AND_SPECIAL_INSTRUCTIONS, f"{eus_reason} {si_reason}"
+    if eus_reason:
+        return OrderRoute.EUS, eus_reason
+    if si_reason:
+        return OrderRoute.SPECIAL_INSTRUCTIONS, si_reason
     return (
-        RouteDecision.STANDARD,
-        f"No EUS country or special-instructions match for destination {destination or 'unknown'}.",
+        OrderRoute.STANDARD,
+        f"No EUS or special instructions needed for {destination or 'an unknown country'}.",
     )

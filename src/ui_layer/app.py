@@ -1,193 +1,76 @@
-"""MfgOps Order Validation UI (Streamlit).
+"""MfgOps Order Review (Streamlit), written for MfgOps users, not IT.
 
 Run from the repo root with `make ui` (python -m streamlit run src/ui_layer/app.py).
-Tabs: Analytics (default), Approval Queue, Order Tracker, Knowledge Addition, EUS Approval.
+Tabs: Dashboard, Orders to Review, Order Tracker, Rules Assistant, EUS Approval.
 """
 
-import json
-import re
+import uuid
 from pathlib import Path
 from typing import Optional
 
 import streamlit as st
 
 from src.app import prepare_database, run_pipeline_once
-from src.integration_layer.push_orders_to_b2b import push_order
-from src.integration_layer.send_back_to_om import send_back_to_om
-from src.intelligence_layer.order_validation import (
-    FACT_DESCRIPTIONS,
-    SUPPORTED_OPERATORS,
+from src.intelligence_layer import rules_assistant
+from src.intelligence_layer.order_review_workflow import submit_reviewer_decision
+from src.intelligence_layer.rule_checks import find_release_blocker
+from src.knowledge_layer import (
+    learning_request_store,
+    order_store,
+    reference_store,
+    rule_store,
 )
-from src.knowledge_layer import order_store, reference_store, rule_store
 from src.utils.config import load_config
-from src.utils.models import AiRecommendation, Order, RouteDecision, Rule, RuleAction
-from src.utils.time_helpers import utc_now_iso
+from src.utils.models import (
+    OUTCOME_LABELS,
+    REVIEWABLE_STATUSES,
+    ROUTE_LABELS,
+    Order,
+    OrderStatus,
+    ReviewerDecision,
+    RuleOutcome,
+    RuleType,
+)
 
-ACTION_STYLES = {
-    RuleAction.BLOCK.value: st.error,
-    RuleAction.REQUIRE_DOC.value: st.error,
-    RuleAction.WARN.value: st.warning,
+VERDICT_LABELS = {
+    "approve": "✅ Release to Arrow",
+    "reject": "⛔ Send back to OM",
+    "hold": "⏸️ Hold — needs a check",
+}
+DECISION_LABELS = {
+    ReviewerDecision.APPROVE.value: "Approved",
+    ReviewerDecision.SEND_TO_OM.value: "Sent to OM",
+    ReviewerDecision.HOLD.value: "On hold",
+}
+STATUS_LABELS = {
+    OrderStatus.NEW.value: "Being checked",
+    OrderStatus.WAITING_FOR_REVIEW.value: "Waiting for your review",
+    OrderStatus.ON_HOLD.value: "On hold",
+    OrderStatus.SENT_TO_OM.value: "Sent to OM — waiting for correction",
+    OrderStatus.RELEASED.value: "Released to Arrow",
+}
+FINDING_STYLES = {
+    RuleOutcome.REJECT.value: (st.error, "⛔"),
+    RuleOutcome.HOLD.value: (st.warning, "⏸️"),
+    RuleOutcome.WARN.value: (st.info, "⚠️"),
 }
 
 
-def render_sidebar() -> str:
-    """Show who is reviewing, the current modes, and a manual refresh button.
-
-    Returns:
-        The reviewer's name ("" until entered).
-    """
-    config = load_config()
-    st.sidebar.header("Reviewer")
-    reviewer = st.sidebar.text_input(
-        "Your name (recorded on every decision)", key="reviewer"
-    )
-    st.sidebar.header("Fusion")
-    st.sidebar.write(
-        f"Fusion mode: **{config.fusion_mode}** · Email mode: **{config.email_mode}**"
-    )
-    st.sidebar.write(
-        f"LLM explanations: **{'on' if config.llm_enabled else 'off (template)'}**"
-    )
-    if st.sidebar.button("Fetch & validate now"):
-        try:
-            summary = run_pipeline_once()
-            st.sidebar.success(
-                f"Synced {summary['sync']}, validated {summary['validated']}, "
-                f"closed {summary['closed']}."
-            )
-        except Exception as error:
-            st.sidebar.error(f"Pipeline failed: {error}")
-    return reviewer.strip()
-
-
-def render_analytics_tab() -> None:
-    """Show the business value delivered: volume, quality/trust and time saved.
-
-    Returns:
-        None.
-    """
-    config = load_config()
-    metrics = order_store.get_order_history_metrics(config.minutes_saved_per_order)
-
-    def as_percent(value: Optional[float]) -> str:
-        """Format a 0-1 rate as a percentage, or "n/a"."""
-        return "n/a" if value is None else f"{value:.0%}"
-
-    columns = st.columns(4)
-    columns[0].metric("Orders released & closed", metrics["orders_closed"])
-    columns[1].metric("AI / human agreement", as_percent(metrics["agreement_rate"]))
-    columns[2].metric(
-        "First-pass rate (no rework)", as_percent(metrics["first_pass_rate"])
-    )
-    columns[3].metric("Hours saved (estimate)", f"{metrics['hours_saved']:.1f}")
-    columns = st.columns(4)
-    columns[0].metric("Decisions logged", metrics["decisions_total"])
-    columns[1].metric("Overrides", metrics["overrides"])
-    columns[2].metric("Sent back to OM", metrics["sent_back"])
-    average = metrics["avg_minutes_detected_to_released"]
-    columns[3].metric(
-        "Avg minutes detected → released",
-        "n/a" if average is None else f"{average:.0f}",
-    )
-    st.caption(
-        f"Hours saved assumes {config.minutes_saved_per_order:g} manual minutes per order "
-        "(MINUTES_SAVED_PER_ORDER); replace with the shadow-mode baseline."
-    )
-    left, right = st.columns(2)
-    with left:
-        st.subheader("Closed orders by route")
-        if metrics["closed_by_route"]:
-            st.bar_chart(metrics["closed_by_route"])
-        else:
-            st.info("No closed orders yet.")
-    with right:
-        st.subheader("Active orders by status")
-        if metrics["active_by_status"]:
-            st.bar_chart(metrics["active_by_status"])
-        else:
-            st.info("No active orders.")
-
-
-def handle_decision(order_no: str, action: str, reviewer: str) -> None:
-    """Carry out a reviewer's button press. Runs as a callback, before the page redraws.
+def label(labels: dict, value: Optional[str]) -> str:
+    """Look up the friendly name of a stored value.
 
     Args:
-        order_no: Fusion order number.
-        action: "approve", "override" or "send_back".
-        reviewer: Name of the MfgOps user.
+        labels: Value-to-name mapping.
+        value: The stored value.
 
     Returns:
-        None. The outcome is left in session state for the next redraw to show.
+        The friendly name, the value itself if unknown, or "—" if empty.
     """
-    comment = st.session_state.get(f"comment_{order_no}", "")
-    try:
-        if action == "approve":
-            push_order(order_no, reviewer, comment or None)
-            message = f"{order_no} released. It closes once Arrow's USPO appears."
-        elif action == "override":
-            push_order(order_no, reviewer, comment, override=True)
-            message = f"{order_no} released with override."
-        else:
-            send_back_to_om(order_no, reviewer, comment)
-            message = f"{order_no} sent back to OM."
-        st.session_state["flash_message"] = message
-    except ValueError as error:
-        st.session_state["flash_error"] = f"{order_no}: {error}"
+    return labels.get(value, value) if value else "—"
 
 
-def render_order_actions(order: Order, reviewer: str) -> None:
-    """Show the comment box and Approve / Override / Send back buttons for one order.
-
-    Args:
-        order: The order under review.
-        reviewer: Name of the MfgOps user ("" disables the buttons).
-
-    Returns:
-        None.
-    """
-    ai_approves = order.ai_recommendation == AiRecommendation.APPROVE.value
-    # One form per order so the comment is submitted together with the button press.
-    with st.form(key=f"decision_{order.order_no}"):
-        st.text_area(
-            "Comment (required to override or send back)",
-            key=f"comment_{order.order_no}",
-        )
-        approve_col, override_col, send_back_col = st.columns(3)
-        buttons = [
-            (
-                approve_col,
-                "Approve & Push",
-                "approve",
-                not (reviewer and ai_approves),
-                None,
-            ),
-            (
-                override_col,
-                "Override & Push",
-                "override",
-                not reviewer or ai_approves,
-                "Push despite the findings, e.g. when the EUS was approved by email.",
-            ),
-            (send_back_col, "Send back to OM", "send_back", not reviewer, None),
-        ]
-        for column, label, action, disabled, help_text in buttons:
-            column.form_submit_button(
-                label,
-                key=f"{action}_{order.order_no}",
-                disabled=disabled,
-                help=help_text,
-                on_click=handle_decision,
-                args=(order.order_no, action, reviewer),
-            )
-    if not reviewer:
-        st.caption("Enter your name in the sidebar to enable the buttons.")
-
-
-def render_approval_queue_tab(reviewer: str) -> None:
-    """List every order waiting for a decision, with findings and AI explanation.
-
-    Args:
-        reviewer: Name of the MfgOps user.
+def show_flash_messages() -> None:
+    """Show the outcome of the last button press (saved before the page redrew).
 
     Returns:
         None.
@@ -196,72 +79,285 @@ def render_approval_queue_tab(reviewer: str) -> None:
         st.success(st.session_state.pop("flash_message"))
     if "flash_error" in st.session_state:
         st.error(st.session_state.pop("flash_error"))
-    orders = order_store.get_active_orders(order_store.REVIEWABLE_STATUSES)
-    route_filter = st.multiselect(
-        "Routes",
-        [route.value for route in RouteDecision],
-        default=[route.value for route in RouteDecision],
+
+
+def render_sidebar() -> str:
+    """Show who is reviewing and the button that checks Fusion for new orders.
+
+    Returns:
+        The reviewer's name ("" until entered).
+    """
+    config = load_config()
+    st.sidebar.header("👤 Reviewer")
+    reviewer = st.sidebar.text_input(
+        "Your name (saved with every decision)", key="reviewer"
     )
-    orders = [order for order in orders if order.route in route_filter]
-    if not orders:
-        st.info(
-            "Nothing waiting for review. Use 'Fetch & validate now' in the sidebar."
+    st.sidebar.header("📥 New orders")
+    if st.sidebar.button("Check Fusion for new orders", width="stretch"):
+        with st.spinner("Fetching orders and reviewing them..."):
+            try:
+                summary = run_pipeline_once()
+                sync = summary["sync"]
+                st.sidebar.success(
+                    f"{sync['new']} new and {sync['updated']} corrected order(s) found, "
+                    f"{summary['reviewed']} reviewed."
+                )
+            except Exception as error:
+                st.sidebar.error(f"Something went wrong: {error}")
+    if config.fusion_mode == "file":
+        source = f"backlog report “{Path(config.backlog_file_path or '').name}”"
+        if config.include_demo_orders:
+            source += " + 10 demo problem orders"
+    else:
+        source = (
+            "sample orders (test mode)" if config.fusion_mode == "mock" else "Fusion"
         )
+    st.sidebar.caption(f"Orders come from: {source}")
+    st.sidebar.caption(
+        "AI review: " + ("on" if config.llm_enabled else "off — only fixed checks run")
+    )
+    return reviewer.strip()
+
+
+def render_dashboard_tab() -> None:
+    """Show the business value: orders handled, AI accuracy and time saved.
+
+    Returns:
+        None.
+    """
+    config = load_config()
+    numbers = order_store.get_dashboard_numbers(config.minutes_saved_per_order)
+
+    def as_percent(value: Optional[float]) -> str:
+        """Format a 0-1 rate as a percentage. Returns: e.g. "85%" or "—"."""
+        return "—" if value is None else f"{value:.0%}"
+
+    columns = st.columns(4)
+    columns[0].metric("Orders received", numbers["orders_seen"])
+    columns[1].metric("Released to Arrow", numbers["released"])
+    columns[2].metric("Sent back to OM", numbers["sent_to_om"])
+    columns[3].metric("Waiting or on hold", numbers["waiting"])
+    columns = st.columns(3)
+    columns[0].metric("AI and reviewer agreed", as_percent(numbers["agreement_rate"]))
+    columns[1].metric(
+        "Released first time (no rework)", as_percent(numbers["first_time_right_rate"])
+    )
+    columns[2].metric("Hours saved (estimate)", f"{numbers['hours_saved']:.1f}")
+    st.caption(
+        f"Hours saved assumes {config.minutes_saved_per_order:g} minutes of manual "
+        "checking per order reviewed by the AI."
+    )
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Orders by category")
+        if numbers["by_route"]:
+            st.bar_chart(
+                {label(ROUTE_LABELS, k): v for k, v in numbers["by_route"].items()},
+                horizontal=True,
+            )
+        else:
+            st.info("No orders yet. Use “Check Fusion for new orders” in the sidebar.")
+    with right:
+        st.subheader("Where orders are now")
+        if numbers["by_status"]:
+            st.bar_chart(
+                {label(STATUS_LABELS, k): v for k, v in numbers["by_status"].items()},
+                horizontal=True,
+            )
+
+
+def handle_decision(order_no: str, decision: str, reviewer: str) -> None:
+    """Carry out a reviewer's button press (runs before the page redraws).
+
+    Args:
+        order_no: Fusion order number.
+        decision: A ReviewerDecision value.
+        reviewer: Name of the MfgOps user.
+
+    Returns:
+        None. The outcome is kept for the next redraw to show.
+    """
+    comment = st.session_state.get(f"comment_{order_no}", "")
+    order = order_store.get_order(order_no)
+    try:
+        submit_reviewer_decision(order_no, decision, reviewer, comment)
+    except ValueError as error:
+        st.session_state["flash_error"] = f"{order_no}: {error}"
         return
+    message = {
+        ReviewerDecision.APPROVE.value: f"{order_no} was released to Arrow.",
+        ReviewerDecision.SEND_TO_OM.value: f"{order_no} was sent back to OM by email.",
+        ReviewerDecision.HOLD.value: f"{order_no} is on hold.",
+    }[decision]
+    if order_store.is_agreement(order.ai_verdict, decision) is False:
+        message += " The AI would like to learn from this — see 💬 Rules Assistant."
+    st.session_state["flash_message"] = message
+
+
+def render_order_details(order: Order) -> None:
+    """Show the order's shipping details and lines.
+
+    Args:
+        order: The order.
+
+    Returns:
+        None.
+    """
+    left, right = st.columns(2)
+    left.markdown(
+        f"**Customer (bill to):** {order.bill_to_customer}  \n"
+        f"**Ship to:** {order.ship_to_customer}, {order.ship_to_address}, "
+        f"{order.ship_to_country}  \n"
+        f"**Ship from:** {order.ship_from or '—'}  \n"
+        f"**Booked:** {order.booked_date}"
+    )
+    right.markdown(
+        f"**Customer PO:** {order.customer_po or '—'}  \n"
+        f"**Shipping method:** {order.shipping_method or '—'}  \n"
+        f"**Incoterm (FOB):** {order.fob or '—'}  \n"
+        f"**Freight terms:** {order.freight_terms or '—'}"
+    )
+    st.markdown(f"**Shipping instructions:** {order.shipping_instructions or '—'}")
+    st.dataframe(
+        [
+            {
+                "Line": line.line_number,
+                "Item": line.sku,
+                "Description": line.item_description,
+                "Qty": line.ordered_qty,
+            }
+            for line in order.lines
+        ],
+        hide_index=True,
+        width="stretch",
+    )
+    st.caption(f"Why this category: {order.route_reason}")
+
+
+def render_decision_buttons(
+    order: Order, blocker: Optional[str], reviewer: str
+) -> None:
+    """Show the comment box and the Approve / Send to OM / Hold buttons.
+
+    Args:
+        order: The order under review.
+        blocker: Why the order can never be released, or None.
+        reviewer: Name of the MfgOps user ("" disables the buttons).
+
+    Returns:
+        None.
+    """
+    with st.form(key=f"decision_{order.order_no}"):
+        st.text_area(
+            "Your comment (needed when sending to OM or disagreeing with the AI)",
+            key=f"comment_{order.order_no}",
+            placeholder="e.g. EUS already sent to Arrow by email / Please add 2 UK power cords",
+        )
+        approve, send, hold = st.columns(3)
+        buttons = [
+            (
+                approve,
+                "✅ Approve & release",
+                ReviewerDecision.APPROVE.value,
+                bool(blocker),
+            ),
+            (send, "📧 Send to OM", ReviewerDecision.SEND_TO_OM.value, False),
+            (hold, "⏸️ Put on hold", ReviewerDecision.HOLD.value, False),
+        ]
+        for column, text, decision, blocked in buttons:
+            column.form_submit_button(
+                text,
+                disabled=not reviewer or blocked,
+                width="stretch",
+                on_click=handle_decision,
+                args=(order.order_no, decision, reviewer),
+            )
+    if not reviewer:
+        st.caption("Enter your name in the sidebar to enable the buttons.")
+
+
+def render_order_card(order: Order, reviewer: str) -> None:
+    """Show one order with the AI's verdict, what was found, and the decision buttons.
+
+    Args:
+        order: The order under review.
+        reviewer: Name of the MfgOps user.
+
+    Returns:
+        None.
+    """
+    findings = order_store.get_rule_findings(order.order_no)
+    blocker = find_release_blocker(findings)
+    title = " · ".join(
+        [
+            f"{VERDICT_LABELS.get(order.ai_verdict, '').split()[0]} {order.order_no}",
+            label(ROUTE_LABELS, order.route),
+            order.ship_to_country,
+            order.order_type,
+            label(STATUS_LABELS, order.status),
+        ]
+    )
+    with st.expander(title):
+        st.markdown(f"#### AI suggests: {label(VERDICT_LABELS, order.ai_verdict)}")
+        if order.ai_summary:
+            st.write(order.ai_summary)
+        for reason in order.ai_reasons:
+            st.markdown(f"- {reason}")
+        if order.arrow_po:
+            st.caption(
+                f"ℹ️ This order already has Arrow PO {order.arrow_po}, so it was sent to Arrow "
+                "before. Orders in the backlog report you loaded are treated as test data."
+            )
+        if blocker:
+            st.error(f"🔒 This order can never be released: {blocker}")
+        if findings:
+            st.markdown("**Fixed checks that flagged this order**")
+            for finding in findings:
+                show, icon = FINDING_STYLES.get(finding.outcome, (st.info, "•"))
+                show(f"{icon} **{finding.rule_name}** — {finding.message}")
+        st.divider()
+        render_order_details(order)
+        render_decision_buttons(order, blocker, reviewer)
+
+
+def render_review_tab(reviewer: str) -> None:
+    """List every order waiting for a decision, held orders included.
+
+    Args:
+        reviewer: Name of the MfgOps user.
+
+    Returns:
+        None.
+    """
+    show_flash_messages()
+    orders = order_store.get_active_orders(REVIEWABLE_STATUSES)
+    if not orders:
+        st.info("Nothing to review. Use “Check Fusion for new orders” in the sidebar.")
+        return
+    without_ai = [order.order_no for order in orders if not order.ai_used]
+    if without_ai:
+        st.warning(
+            f"⚠️ {len(without_ai)} order(s) were checked by the fixed rules only, because "
+            "the AI could not be reached (see each order's summary for the reason). "
+            "Once the connection works, click “Check Fusion for new orders” to review "
+            "them again with the AI."
+        )
+    categories = st.multiselect(
+        "Show categories",
+        list(ROUTE_LABELS),
+        default=list(ROUTE_LABELS),
+        format_func=lambda route: ROUTE_LABELS[route],
+    )
+    st.caption(
+        "✅ AI suggests release · ⛔ AI suggests sending to OM · ⏸️ AI suggests a hold"
+    )
     for order in orders:
-        verdict = (
-            "✅ approve"
-            if order.ai_recommendation == AiRecommendation.APPROVE.value
-            else "⛔ reject"
-        )
-        title = " · ".join(
-            [
-                order.order_no,
-                order.order_type,
-                order.ship_to_country,
-                order.route,
-                f"AI: {verdict}",
-            ]
-        )
-        with st.expander(title):
-            st.write(
-                f"**Status:** {order.status} · **Route reason:** {order.route_reason}"
-            )
-            st.write(
-                f"**Ship to:** {order.ship_to_customer}, {order.ship_to_address}, "
-                f"{order.ship_to_country} · **PO:** {order.customer_po or '—'} · "
-                f"**Shipping:** {order.shipping_method or '—'} · **FOB:** {order.fob or '—'}"
-            )
-            st.write(f"**Shipping instructions:** {order.shipping_instructions or '—'}")
-            st.dataframe(
-                [
-                    {
-                        "Line": line.line_number,
-                        "SKU": line.sku,
-                        "Description": line.item_description,
-                        "Qty": line.ordered_qty,
-                        "Item class": line.item_class,
-                    }
-                    for line in order.lines
-                ],
-                hide_index=True,
-            )
-            findings = order_store.get_validation_results(order.order_no)
-            if findings:
-                st.write("**Findings**")
-                for finding in findings:
-                    ACTION_STYLES.get(finding.action, st.info)(
-                        f"{finding.rule_name}: {finding.message}"
-                    )
-                st.write("**Explanation**")
-                st.info(order.ai_explanation or "—")
-            else:
-                st.success("No issues found.")
-            render_order_actions(order, reviewer)
+        if order.route in categories:
+            render_order_card(order, reviewer)
 
 
-def render_order_tracker_tab() -> None:
-    """Show live status of every active order, and searchable history of closed ones.
+def render_tracker_tab() -> None:
+    """Show where every active order is, and the full record of all orders.
 
     Returns:
         None.
@@ -273,237 +369,257 @@ def render_order_tracker_tab() -> None:
             [
                 {
                     "Order": order.order_no,
-                    "Type": order.order_type,
-                    "Route": order.route,
-                    "Status": order.status,
-                    "AI": order.ai_recommendation,
-                    "Decision": order.human_decision,
-                    "Rework": order.rework_count,
-                    "First seen": order.first_seen_at,
-                    "Updated": order.last_updated_at,
+                    "Category": label(ROUTE_LABELS, order.route),
+                    "Country": order.ship_to_country,
+                    "Status": label(STATUS_LABELS, order.status),
+                    "AI suggested": label(VERDICT_LABELS, order.ai_verdict),
+                    "Last decision": label(DECISION_LABELS, order.reviewer_decision),
+                    "Corrections by OM": order.rework_count,
                 }
                 for order in active
             ],
             hide_index=True,
+            width="stretch",
         )
     else:
         st.info("No active orders.")
-    st.subheader("Order history (closed)")
-    search = st.text_input("Search by order number or USPO")
-    history = order_store.get_order_history(search)
-    if history:
-        st.dataframe(history, hide_index=True)
-    else:
-        st.info("No closed orders match.")
-
-
-def save_attachment(uploaded_file) -> str:
-    """Save an uploaded evidence file under ATTACHMENTS_DIR with a safe, unique name.
-
-    Args:
-        uploaded_file: The Streamlit UploadedFile.
-
-    Returns:
-        The saved file's path.
-    """
-    folder = Path(load_config().attachments_dir)
-    folder.mkdir(parents=True, exist_ok=True)
-    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", Path(uploaded_file.name).name)
-    stamp = utc_now_iso().replace(":", "").replace("+0000", "Z")
-    path = folder / f"{stamp}_{safe_name}"
-    path.write_bytes(uploaded_file.getvalue())
-    return str(path)
-
-
-def parse_rule_form(scope_text: str, conditions_text: str) -> tuple:
-    """Parse and check the scope and conditions JSON typed into the rule form.
-
-    Args:
-        scope_text: JSON object, e.g. {"destination_country": ["AE"]}.
-        conditions_text: JSON list, e.g. [{"field": "fob", "op": "missing"}].
-
-    Returns:
-        A (scope, conditions) tuple. Raises ValueError with a readable message.
-    """
-    try:
-        scope = json.loads(scope_text or "{}")
-        conditions = json.loads(conditions_text or "[]")
-    except json.JSONDecodeError as error:
-        raise ValueError(f"Not valid JSON: {error}") from error
-    if not isinstance(scope, dict) or not all(
-        isinstance(v, list) for v in scope.values()
-    ):
-        raise ValueError('Scope must look like {"fact": ["allowed", "values"]}.')
-    if not isinstance(conditions, list):
-        raise ValueError("Conditions must be a JSON list.")
-    for item in list(scope) + [condition.get("field") for condition in conditions]:
-        if item not in FACT_DESCRIPTIONS:
-            raise ValueError(
-                f"Unknown fact {item!r}. See the list of available facts below."
-            )
-    for condition in conditions:
-        if condition.get("op") not in SUPPORTED_OPERATORS:
-            raise ValueError(
-                f"Unknown operator {condition.get('op')!r}; use {SUPPORTED_OPERATORS}."
-            )
-    return scope, conditions
-
-
-def render_rule_form() -> None:
-    """Show the form for adding a business rule with optional evidence.
-
-    Returns:
-        None.
-    """
-    with st.form("add_rule", clear_on_submit=True):
-        name = st.text_input("Rule name")
-        domain = st.selectbox("Domain", rule_store.RULE_DOMAINS)
-        action = st.selectbox("Action", [action.value for action in RuleAction])
-        message = st.text_input("Message shown when it fires (use {fact} placeholders)")
-        scope_text = st.text_area("Scope (JSON, optional)", value="{}")
-        conditions_text = st.text_area(
-            "Conditions (JSON list, all must be true)",
-            value='[{"field": "", "op": "eq", "value": ""}]',
-        )
-        source = st.text_input("Source (who/what this rule comes from)")
-        owner = st.text_input("Owner")
-        evidence = st.file_uploader(
-            "Supporting screenshot or PDF", type=["png", "jpg", "jpeg", "pdf"]
-        )
-        if not st.form_submit_button("Add rule"):
-            return
-    try:
-        if not name.strip() or not message.strip():
-            raise ValueError("Rule name and message are required.")
-        scope, conditions = parse_rule_form(scope_text, conditions_text)
-    except ValueError as error:
-        st.error(str(error))
-        return
-    rule = Rule(
-        name=name.strip(),
-        domain=domain,
-        action=action,
-        message=message.strip(),
-        scope=scope,
-        conditions=conditions,
-        source=source.strip(),
-        owner=owner.strip(),
-        attachment_path=save_attachment(evidence) if evidence else None,
-    )
-    replaced = rule_store.find_contradicting_rules(rule)
-    rule_id = rule_store.add_rule(rule)
-    st.success(f"Rule #{rule_id} added. It applies from the next validation run.")
-    for old in replaced:
-        st.warning(
-            f"Replaced contradicting rule #{old.id} '{old.name}' (v{old.version})."
-        )
-
-
-def render_knowledge_addition_tab() -> None:
-    """Show rule management and reference-list editing.
-
-    Returns:
-        None.
-    """
-    st.subheader("Add a business rule")
-    render_rule_form()
-    with st.expander("Available facts for scope and conditions"):
+    st.subheader("All orders")
+    search = st.text_input("Search by order number or country")
+    rows = order_store.get_all_orders(search)
+    if rows:
         st.dataframe(
             [
-                {"Fact": fact, "Meaning": meaning}
-                for fact, meaning in FACT_DESCRIPTIONS.items()
+                {
+                    "Order": row["order_no"],
+                    "Category": label(ROUTE_LABELS, row["route"]),
+                    "Country": row["ship_to_country"],
+                    "Status": label(STATUS_LABELS, row["status"]),
+                    "AI suggested": label(VERDICT_LABELS, row["ai_verdict"]),
+                    "Reviewer decided": label(
+                        DECISION_LABELS, row["reviewer_decision"]
+                    ),
+                    "Reviewed by": row["decided_by"] or "—",
+                    "Comment": row["reviewer_comment"] or "",
+                    "Released on": (row["released_at"] or "")[:10],
+                }
+                for row in rows
             ],
             hide_index=True,
+            width="stretch",
         )
-        st.write(f"Operators: {', '.join(SUPPORTED_OPERATORS)}")
-
-    st.subheader("Active rules")
-    rules = rule_store.get_active_rules()
-    st.dataframe(
-        [
-            {
-                "ID": rule.id,
-                "Name": rule.name,
-                "Domain": rule.domain,
-                "Action": rule.action,
-                "Scope": json.dumps(rule.scope),
-                "Conditions": json.dumps(rule.conditions),
-                "Version": rule.version,
-                "Source": rule.source,
-                "Evidence": rule.attachment_path or "",
-            }
-            for rule in rules
-        ],
-        hide_index=True,
-    )
-    rule_names = {rule.id: rule.name for rule in rules}
-    with st.form("retire_rule"):
-        st.selectbox(
-            "Retire a rule",
-            [None] + [rule.id for rule in rules],
-            format_func=lambda rule_id: (
-                "" if rule_id is None else f"#{rule_id} {rule_names[rule_id]}"
-            ),
-            key="rule_to_retire",
-        )
-        st.form_submit_button("Retire selected rule", on_click=handle_retire_rule)
-
-    st.subheader("Reference lists")
-    if "reference_message" in st.session_state:
-        st.info(st.session_state.pop("reference_message"))
-    st.dataframe(reference_store.get_reference_rows(), hide_index=True)
-    with st.form("reference_entry"):
-        st.selectbox("List", list(reference_store.SEED_REFERENCE_LISTS), key="ref_list")
-        st.text_input("Key (country code, SKU prefix or customer name)", key="ref_key")
-        st.text_input("Value (description, cord region or ratio)", key="ref_value")
-        st.text_input("Source", key="ref_source")
-        add_col, delete_col = st.columns(2)
-        add_col.form_submit_button(
-            "Add / update entry", on_click=handle_reference_change, args=("add",)
-        )
-        delete_col.form_submit_button(
-            "Delete entry", on_click=handle_reference_change, args=("delete",)
-        )
+    else:
+        st.info("No orders match.")
 
 
-def handle_retire_rule() -> None:
-    """Retire the rule picked in the Retire form (callback, runs before redraw).
+def handle_start_learning_chat(request_id: int, reviewer: str) -> None:
+    """Open the chat where the AI asks about a decision (runs before redraw).
+
+    Args:
+        request_id: The learning request's id.
+        reviewer: Name of the MfgOps user.
 
     Returns:
         None.
     """
-    rule_id = st.session_state.get("rule_to_retire")
-    if rule_id is not None:
-        rule_store.retire_rule(rule_id)
+    st.session_state["chat_thread_id"] = rules_assistant.start_learning_chat(
+        request_id, reviewer
+    )
 
 
-def handle_reference_change(action: str) -> None:
-    """Add/update or delete a reference-list entry (callback, runs before redraw).
-
-    Args:
-        action: "add" or "delete".
+def handle_new_chat() -> None:
+    """Start a fresh Rules Assistant conversation (runs before redraw).
 
     Returns:
-        None. The outcome is left in session state for the redraw to show.
+        None.
     """
-    list_name = st.session_state["ref_list"]
-    key = st.session_state.get("ref_key", "").strip()
-    if not key:
-        st.session_state["reference_message"] = "Key is required."
+    st.session_state["chat_thread_id"] = f"rules-chat-{uuid.uuid4().hex[:8]}"
+
+
+def render_learning_requests(reviewer: str) -> None:
+    """Show the decisions the AI would like to learn from.
+
+    Args:
+        reviewer: Name of the MfgOps user.
+
+    Returns:
+        None.
+    """
+    requests = learning_request_store.get_open_learning_requests()
+    if not requests:
         return
-    if action == "add":
-        reference_store.upsert_reference_value(
-            list_name,
-            key,
-            st.session_state.get("ref_value", ""),
-            st.session_state.get("ref_source", ""),
+    st.warning(f"🎓 The AI would like to learn from {len(requests)} of your decisions.")
+    for request in requests:
+        text, talk, dismiss = st.columns([4, 1, 1])
+        decision = label(DECISION_LABELS, request["reviewer_decision"])
+        text.write(
+            f"**{request['order_no']}** — AI suggested "
+            f"{label(VERDICT_LABELS, request['ai_verdict'])}, "
+            f"{request['decided_by']} chose “{decision}”."
         )
-        st.session_state["reference_message"] = f"Saved {key.upper()} in {list_name}."
-    else:
-        reference_store.delete_reference_value(list_name, key)
-        st.session_state["reference_message"] = (
-            f"Deleted {key.upper()} from {list_name}."
+        talk.button(
+            "Talk about it",
+            key=f"learn_{request['id']}",
+            disabled=not reviewer,
+            on_click=handle_start_learning_chat,
+            args=(request["id"], reviewer),
         )
+        dismiss.button(
+            "Dismiss",
+            key=f"dismiss_{request['id']}",
+            on_click=learning_request_store.close_learning_request,
+            args=(request["id"],),
+        )
+
+
+def render_chat(reviewer: str) -> None:
+    """Show the Rules Assistant conversation, the Save/Don't save buttons, or the input box.
+
+    Args:
+        reviewer: Name of the MfgOps user.
+
+    Returns:
+        None.
+    """
+    if "chat_thread_id" not in st.session_state:
+        handle_new_chat()
+    thread_id = st.session_state["chat_thread_id"]
+    messages, change_waiting = rules_assistant.get_conversation(thread_id)
+    if not messages:
+        st.chat_message("assistant").write(
+            "Hi! I can show, add, change or remove the rules used to check orders. "
+            "Try: “Orders to Saudi Arabia need a commercial invoice”, “Show me the power "
+            "cord rules”, or “Add Russia to the embargoed countries”."
+        )
+    for message in messages:
+        st.chat_message(message["role"]).markdown(message["content"])
+    if change_waiting:
+        with st.chat_message("assistant"):
+            st.info(change_waiting)
+            yes, no = st.columns(2)
+            if yes.button("✅ Yes, save it", width="stretch"):
+                with st.spinner("Saving..."):
+                    rules_assistant.answer_change_request(thread_id, True)
+                st.rerun()
+            if no.button("✖️ No, don't save", width="stretch"):
+                with st.spinner("..."):
+                    rules_assistant.answer_change_request(thread_id, False)
+                st.rerun()
+        return
+    if not reviewer:
+        st.caption("Enter your name in the sidebar to chat.")
+        return
+    text = st.chat_input("Describe a rule to add, change or remove…")
+    if text:
+        st.chat_message("user").markdown(text)
+        with st.spinner("Thinking..."):
+            rules_assistant.send_chat_message(thread_id, text, reviewer)
+        st.rerun()
+
+
+def remember_rules_at_start() -> None:
+    """Note the rules and list entries as they were when this browser session began.
+
+    Anything different later is shown as new or changed.
+
+    Returns:
+        None.
+    """
+    if "rules_at_start" in st.session_state:
+        return
+    st.session_state["rules_at_start"] = {
+        rule.id: rule.version for rule in rule_store.get_rules()
+    }
+    st.session_state["list_entries_at_start"] = {
+        name: set(entries)
+        for name, entries in reference_store.get_all_reference_lists().items()
+    }
+
+
+def mark_rule_change(rule) -> str:
+    """Say whether a rule is new or changed since this session began.
+
+    Args:
+        rule: The rule.
+
+    Returns:
+        "🆕 New", "✏️ Changed", or "".
+    """
+    version_at_start = st.session_state["rules_at_start"].get(rule.id)
+    if version_at_start is None:
+        return "🆕 New"
+    return "✏️ Changed" if rule.version > version_at_start else ""
+
+
+def render_rules_and_lists() -> None:
+    """Show the current rules and lists in plain words (changed only through the chat).
+
+    They are read fresh on every page refresh, so a saved change appears straight away;
+    new and changed items are marked, and the section opens when something changed.
+
+    Returns:
+        None.
+    """
+    rules = rule_store.get_rules()
+    marks = {rule.id: mark_rule_change(rule) for rule in rules}
+    lists = reference_store.get_all_reference_lists()
+    entries_at_start = st.session_state["list_entries_at_start"]
+    new_entries = {
+        name: set(entries) - entries_at_start.get(name, set())
+        for name, entries in lists.items()
+    }
+    with st.expander("📚 Current business rules", expanded=any(marks.values())):
+        st.dataframe(
+            [
+                {
+                    "": marks[rule.id],
+                    "No.": rule.id,
+                    "Rule": rule.name,
+                    "What it checks": rule.description,
+                    "Checked by": (
+                        "Fixed check"
+                        if rule.rule_type == RuleType.HARD.value
+                        else "AI judgement"
+                    ),
+                    "Applies to": rules_assistant.describe_where_rule_applies(rule),
+                    "If a problem is found": label(OUTCOME_LABELS, rule.outcome),
+                    "Can override": "Yes" if rule.can_be_overridden else "No",
+                    "Source": rule.source,
+                }
+                for rule in rules
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+    with st.expander("📋 Lists used by the rules", expanded=any(new_entries.values())):
+        for list_name, list_label in reference_store.LIST_LABELS.items():
+            entries = lists.get(list_name, {})
+            st.markdown(f"**{list_label}**")
+            st.write(
+                ", ".join(
+                    ("🆕 " if key in new_entries.get(list_name, set()) else "")
+                    + f"{key} ({value})"
+                    for key, value in entries.items()
+                )
+                or "—"
+            )
+
+
+def render_rules_assistant_tab(reviewer: str) -> None:
+    """Show learning requests, the chat, and the current rules and lists.
+
+    Args:
+        reviewer: Name of the MfgOps user.
+
+    Returns:
+        None.
+    """
+    render_learning_requests(reviewer)
+    top_left, top_right = st.columns([4, 1])
+    top_left.caption("Chat with the AI to look up, add, change or remove rules.")
+    top_right.button("Start new chat", on_click=handle_new_chat, width="stretch")
+    render_chat(reviewer)
+    st.divider()
+    render_rules_and_lists()
 
 
 def render_eus_placeholder_tab() -> None:
@@ -512,39 +628,49 @@ def render_eus_placeholder_tab() -> None:
     Returns:
         None.
     """
-    st.info(
-        "EUS Approval is a work in progress (EUS workstream). No data in this phase."
-    )
+    st.info("EUS Approval is coming soon (EUS workstream).")
 
 
 def main() -> None:
-    """Build the page and its five tabs.
+    """Build the page and its tabs.
 
     Returns:
         None.
     """
-    st.set_page_config(page_title="MfgOps Order Validation", layout="wide")
-    st.title("MfgOps · B2B Push to Arrow · Order Validation")
+    st.set_page_config(page_title="MfgOps Order Review", page_icon="📦", layout="wide")
+    st.title("📦 MfgOps · Order Review before release to Arrow")
     prepare_database()
+    remember_rules_at_start()
     reviewer = render_sidebar()
-    analytics, queue, tracker, knowledge, eus = st.tabs(
+    to_review = len(order_store.get_active_orders(REVIEWABLE_STATUSES))
+    to_learn = len(learning_request_store.get_open_learning_requests())
+    if to_review:
+        st.sidebar.info(f"📝 {to_review} order(s) waiting in Orders to Review")
+    if to_learn:
+        st.sidebar.warning(
+            f"🔔 The AI has {to_learn} question(s) for you in Rules Assistant"
+        )
+    # Fixed tab names, so the open tab stays open after every button click.
+    tabs = st.tabs(
         [
-            "Analytics",
-            "Approval Queue",
-            "Order Tracker",
-            "Knowledge Addition",
-            "EUS Approval",
-        ]
+            "📊 Dashboard",
+            "📝 Orders to Review",
+            "📦 Order Tracker",
+            "💬 Rules Assistant",
+            "🛂 EUS Approval",
+        ],
+        key="main_tabs",
+        on_change="rerun",
     )
-    with analytics:
-        render_analytics_tab()
-    with queue:
-        render_approval_queue_tab(reviewer)
-    with tracker:
-        render_order_tracker_tab()
-    with knowledge:
-        render_knowledge_addition_tab()
-    with eus:
+    with tabs[0]:
+        render_dashboard_tab()
+    with tabs[1]:
+        render_review_tab(reviewer)
+    with tabs[2]:
+        render_tracker_tab()
+    with tabs[3]:
+        render_rules_assistant_tab(reviewer)
+    with tabs[4]:
         render_eus_placeholder_tab()
 
 

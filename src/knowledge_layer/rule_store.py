@@ -1,144 +1,279 @@
-"""Stores business rules. Rules persist forever unless a newer rule contradicts them.
+"""Stores business rules: add, read, change and retire them.
 
-A new rule "contradicts" an active one when both have the same domain, the same scope
-and check the same set of facts. The older rule is then deleted. This is a simple,
-predictable heuristic, not a general conflict solver.
+Rules are never hard-deleted; retiring one switches it off but keeps it for the record.
+A new hard rule "contradicts" an active one when both cover the same order categories and
+scope and check the same facts; the older one is then retired automatically.
 """
 
 import json
-from typing import List, Optional
+from dataclasses import asdict, fields
+from typing import Any, Dict, List, Optional
 
 from src.knowledge_layer.db import get_connection
 from src.utils.logging_config import get_logger
-from src.utils.models import RouteDecision, Rule, RuleAction
+from src.utils.models import (
+    EUS_ROUTES,
+    SPECIAL_INSTRUCTION_ROUTES,
+    Rule,
+    RuleOutcome,
+    RuleStatus,
+    RuleType,
+)
 from src.utils.time_helpers import utc_now_iso
 
 logger = get_logger(__name__)
 
-ORDER_VALIDATION = "order_validation"
-SPECIAL_INSTRUCTIONS = "special_instructions"
-RULE_DOMAINS = [ORDER_VALIDATION, SPECIAL_INSTRUCTIONS]
+# Rule fields stored as JSON text, and their column names.
+JSON_COLUMNS = {
+    "applies_to_routes": "applies_to_routes_json",
+    "scope": "scope_json",
+    "conditions": "conditions_json",
+}
+BOOLEAN_FIELDS = {"can_be_overridden", "confirmed"}
+# Fields a user may change through the Rules Assistant.
+EDITABLE_FIELDS = [
+    "name",
+    "rule_type",
+    "outcome",
+    "description",
+    "category",
+    "applies_to_routes",
+    "scope",
+    "conditions",
+    "guidance",
+    "message",
+    "can_be_overridden",
+    "severity",
+    "source",
+    "owner",
+]
 
-JENNIFER = "Jennifer (order validation rules reply)"
+JENNIFER = "Jennifer Walker (order validation rules email)"
+TRADE_COMPLIANCE = "Seed list — confirm with Trade Compliance"
+MANDATORY_FIELDS = "Mandatory order fields (research plan)"
+
+
+def hard_rule(name: str, outcome: str, description: str, **details) -> Rule:
+    """Build a seed hard rule (a fixed check run by code).
+
+    Args:
+        name: Rule name.
+        outcome: A RuleOutcome value.
+        description: Plain-English description.
+        **details: Any other Rule field (conditions, message, scope...).
+
+    Returns:
+        The Rule.
+    """
+    return Rule(
+        name=name,
+        rule_type=RuleType.HARD.value,
+        outcome=outcome,
+        description=description,
+        confirmed=True,
+        **details,
+    )
+
+
+def soft_rule(
+    name: str, outcome: str, description: str, guidance: str, **details
+) -> Rule:
+    """Build a seed soft rule (judged by the AI using its guidance).
+
+    Args:
+        name: Rule name.
+        outcome: The usual RuleOutcome when the rule finds a problem.
+        description: Plain-English description.
+        guidance: How the AI should judge it.
+        **details: Any other Rule field (scope, source...).
+
+    Returns:
+        The Rule.
+    """
+    return Rule(
+        name=name,
+        rule_type=RuleType.SOFT.value,
+        outcome=outcome,
+        description=description,
+        guidance=guidance,
+        **details,
+    )
+
+
 SEED_RULES = [
-    Rule(
-        name="Embargoed destination",
-        domain=ORDER_VALIDATION,
-        action=RuleAction.BLOCK.value,
+    hard_rule(
+        "Embargoed destination",
+        RuleOutcome.REJECT.value,
+        "Orders going to an embargoed country can never be released.",
+        category="embargo",
         conditions=[{"field": "is_embargoed_destination", "op": "eq", "value": True}],
-        message="Destination {destination_country} is on the embargoed-country list.",
-        source="Legal EUS guide (seed list — confirm with Trade Compliance)",
+        message="Destination {destination_country} is an embargoed country.",
+        can_be_overridden=False,
+        severity="critical",
+        source=TRADE_COMPLIANCE,
     ),
-    Rule(
-        name="Missing shipping method",
-        domain=ORDER_VALIDATION,
-        action=RuleAction.BLOCK.value,
+    hard_rule(
+        "Banned customer",
+        RuleOutcome.REJECT.value,
+        "Orders for a banned customer can never be released.",
+        category="banned_customer",
+        conditions=[{"field": "is_banned_customer", "op": "eq", "value": True}],
+        message="The customer is on the banned-customer list.",
+        can_be_overridden=False,
+        severity="critical",
+        source=TRADE_COMPLIANCE,
+    ),
+    hard_rule(
+        "Missing shipping method",
+        RuleOutcome.REJECT.value,
+        "Every order needs a shipping method.",
+        category="mandatory_field",
         conditions=[{"field": "shipping_method", "op": "missing"}],
         message="Shipping method is empty.",
-        source="Research plan (mandatory fields)",
+        source=MANDATORY_FIELDS,
     ),
-    Rule(
-        name="Missing customer PO",
-        domain=ORDER_VALIDATION,
-        action=RuleAction.BLOCK.value,
-        conditions=[{"field": "customer_po", "op": "missing"}],
-        message="Customer PO number is empty.",
-        source="Research plan (mandatory fields)",
-    ),
-    Rule(
-        name="Missing FOB / incoterm",
-        domain=ORDER_VALIDATION,
-        action=RuleAction.BLOCK.value,
+    hard_rule(
+        "Missing FOB / incoterm",
+        RuleOutcome.REJECT.value,
+        "Every order needs an FOB / incoterm.",
+        category="mandatory_field",
         conditions=[{"field": "fob", "op": "missing"}],
         message="FOB / incoterm is empty.",
-        source="Research plan (mandatory fields)",
+        source=MANDATORY_FIELDS,
     ),
-    Rule(
-        name="Missing ship-to phone",
-        domain=ORDER_VALIDATION,
-        action=RuleAction.BLOCK.value,
+    hard_rule(
+        "Missing ship-to phone",
+        RuleOutcome.REJECT.value,
+        "The shipping instructions must include a ship-to contact phone number.",
+        category="mandatory_field",
         conditions=[{"field": "ship_to_phone_present", "op": "eq", "value": False}],
         message="Shipping instructions have no ship-to contact phone number.",
-        source="Research plan (mandatory fields)",
+        source=MANDATORY_FIELDS,
     ),
-    Rule(
-        name="Power-cord count",
-        domain=ORDER_VALIDATION,
-        action=RuleAction.BLOCK.value,
-        conditions=[{"field": "power_cord_count_ok", "op": "eq", "value": False}],
-        message=(
-            "Expected {expected_power_cord_qty} power cord(s) for the appliances and "
-            "power supplies on this order, found {power_cord_qty}."
-        ),
-        source=JENNIFER + " — TE-2306 and TE-906-2AC ratios inferred, confirm",
-    ),
-    Rule(
-        name="Power-cord region",
-        domain=ORDER_VALIDATION,
-        action=RuleAction.BLOCK.value,
+    hard_rule(
+        "Power cord type matches the country",
+        RuleOutcome.REJECT.value,
+        "Power cords must suit the destination country (e.g. no EU cords on a UK order).",
+        category="power_cords",
         conditions=[{"field": "cord_region_ok", "op": "eq", "value": False}],
         message=(
-            "Destination {destination_country} needs {expected_cord_region} power cords, "
+            "{destination_country} needs {expected_cord_region} power cords, "
             "but the order has {power_cord_regions} cords."
         ),
         source=JENNIFER,
     ),
-    Rule(
-        name="No cord mapping for destination",
-        domain=ORDER_VALIDATION,
-        action=RuleAction.WARN.value,
+    hard_rule(
+        "Power cord type unknown for the country",
+        RuleOutcome.WARN.value,
+        "Warn when no power cord type is recorded for the destination country.",
+        category="power_cords",
         conditions=[{"field": "cord_region_known", "op": "eq", "value": False}],
         message=(
-            "No power-cord region is mapped for {destination_country} (order has "
-            "{power_cord_regions} cords). Check against Jennifer's cord-to-country map."
+            "No power cord type is recorded for {destination_country} (order has "
+            "{power_cord_regions} cords). Please check the cords yourself."
         ),
         source="Dry run on Udit's backlog extract",
     ),
-    Rule(
-        name="SFP+ without a 10GE appliance",
-        domain=ORDER_VALIDATION,
-        action=RuleAction.BLOCK.value,
+    hard_rule(
+        "SFP+ transceivers need a 10GE appliance",
+        RuleOutcome.REJECT.value,
+        "SFP+ (10GE) transceivers can only ship with a 10GE appliance.",
+        category="compatibility",
         conditions=[{"field": "sfp_compatible", "op": "eq", "value": False}],
         message="Order has {sfp_plus_qty} SFP+ (10GE) transceiver(s) but no 10GE appliance.",
-        source=JENNIFER,
+        source=JENNIFER + " (FED-1103664 was cancelled and rebooked)",
     ),
-    Rule(
-        name="Order documents not received",
-        domain=SPECIAL_INSTRUCTIONS,
-        action=RuleAction.REQUIRE_DOC.value,
-        scope={
-            "route": [RouteDecision.SPECIAL_INSTRUCTIONS.value, RouteDecision.EUS.value]
-        },
-        conditions=[{"field": "documents_received", "op": "eq", "value": False}],
-        message=(
-            "Waiting for OM's order mail (PO and special instructions). Mail matching is "
-            "not automated yet: the MfgOps reviewer confirms by email, then uses "
-            "Override & Push."
-        ),
-        source="Centralized plan, step 6",
-    ),
-    Rule(
-        name="Approved EUS not linked",
-        domain=ORDER_VALIDATION,
-        action=RuleAction.REQUIRE_DOC.value,
-        scope={"route": [RouteDecision.EUS.value]},
+    hard_rule(
+        "Approved EUS needed",
+        RuleOutcome.HOLD.value,
+        "EUS orders are held until an approved End-Use Statement is linked.",
+        category="eus",
+        applies_to_routes=EUS_ROUTES,
         conditions=[{"field": "eus_case_id", "op": "missing"}],
         message=(
-            "No approved EUS is linked to this order yet. The MfgOps reviewer confirms "
-            "the EUS approval, then uses Override & Push."
+            "No approved EUS is linked to this order yet. If the EUS was already "
+            "checked and sent to Arrow by email, you can approve it."
+        ),
+        source=JENNIFER,
+    ),
+    hard_rule(
+        "OM's order email needed",
+        RuleOutcome.HOLD.value,
+        "Special-instruction orders wait for OM's email with the PO and instructions.",
+        category="documents",
+        applies_to_routes=SPECIAL_INSTRUCTION_ROUTES,
+        conditions=[{"field": "documents_received", "op": "eq", "value": False}],
+        message=(
+            "Waiting for OM's order email (PO and special instructions). Matching it "
+            "isn't automated yet: once you've confirmed it by email, you can approve."
         ),
         source="Centralized plan, step 6",
     ),
-    Rule(
-        name="Blue-ink sign and stamp",
-        domain=SPECIAL_INSTRUCTIONS,
-        action=RuleAction.WARN.value,
-        scope={"destination_country": ["AE", "QA"]},
-        conditions=[],
-        message=(
-            "{destination_country} orders need documents signed and stamped in blue ink. "
-            "Include this in the Arrow email."
+    soft_rule(
+        "Power cords per appliance",
+        RuleOutcome.REJECT.value,
+        "Each appliance and power supply ships with the right number of power cords.",
+        guidance=(
+            "Cords needed per unit: TE-1606 = 2, TE-1506 = 1, each PSU (T-PSU600-AC) = 1; "
+            "TE-2306 and TE-906-2AC = 2 (inferred, not yet confirmed). Compare "
+            "power_cord_qty with expected_power_cord_qty. Fewer cords than needed: "
+            "reject so OM adds them. More cords than needed, or mixed cord types: hold "
+            "so the reviewer checks with OM. If a model's ratio is unknown, say which "
+            "model and only hold if the count looks wrong."
         ),
+        category="power_cords",
+        source=JENNIFER,
+    ),
+    soft_rule(
+        "Ship-from and ship-to look right",
+        RuleOutcome.WARN.value,
+        "Ship-from and ship-to are checked on every order.",
+        guidance=(
+            "The exact rule is not confirmed yet. Only mention it if ship-from is given "
+            "and clearly doesn't fit the ship-to address or country. Never reject on "
+            "this alone."
+        ),
+        category="shipping",
+        source=JENNIFER + " — exact rule to be confirmed",
+    ),
+    soft_rule(
+        "Blue-ink sign and stamp (UAE, Qatar)",
+        RuleOutcome.WARN.value,
+        "UAE and Qatar orders need documents signed and stamped in blue ink.",
+        guidance=(
+            "Remind the reviewer that the documents need a sign and stamp in blue ink "
+            "and that a follow-up email is needed. This alone is not a reason to reject."
+        ),
+        category="special_instructions",
+        scope={"destination_country": ["AE", "QA"]},
+        source=JENNIFER,
+    ),
+    soft_rule(
+        "Special shipping comments go in the Arrow email",
+        RuleOutcome.WARN.value,
+        "Special shipping comments must be passed on to Arrow.",
+        guidance=(
+            "If the shipping instructions contain special comments (carrier account "
+            "number, no partial shipment, ECCN / HS code / country of origin on invoices, "
+            "a freight forwarder or contact to call first), list them so the reviewer "
+            "includes them in the Arrow email."
+        ),
+        category="special_instructions",
+        applies_to_routes=SPECIAL_INSTRUCTION_ROUTES,
+        source=JENNIFER,
+    ),
+    soft_rule(
+        "Letter-of-credit orders are held",
+        RuleOutcome.HOLD.value,
+        "Letter-of-credit (L/C) orders, e.g. Expernet South Korea, are handled by hand.",
+        guidance=(
+            "L/C orders need a custom commercial invoice that matches the letter of "
+            "credit to the penny, which is out of scope for now: always hold them for the "
+            "reviewer. Signs of an L/C order: 'L/C', 'LC' or 'letter of credit' in the "
+            "order text, or an Expernet order to South Korea unless it is clearly a normal "
+            "30-day order (those ship from Hungary like any international order)."
+        ),
+        category="complex_order",
         source=JENNIFER,
     ),
 ]
@@ -153,94 +288,120 @@ def row_to_rule(row) -> Rule:
     Returns:
         A Rule.
     """
-    return Rule(
-        id=row["id"],
-        name=row["name"],
-        domain=row["domain"],
-        action=row["action"],
-        message=row["message"],
-        scope=json.loads(row["scope_json"]),
-        conditions=json.loads(row["conditions_json"]),
-        source=row["source"] or "",
-        owner=row["owner"] or "",
-        version=row["version"],
-        attachment_path=row["attachment_path"],
-        is_active=bool(row["is_active"]),
-        created_at=row["created_at"],
-    )
+    data = {}
+    for rule_field in fields(Rule):
+        name = rule_field.name
+        if name in JSON_COLUMNS:
+            data[name] = json.loads(row[JSON_COLUMNS[name]] or "null") or (
+                {} if name == "scope" else []
+            )
+        elif name in BOOLEAN_FIELDS:
+            data[name] = bool(row[name])
+        else:
+            value = row[name]
+            data[name] = "" if value is None and rule_field.default == "" else value
+    return Rule(**data)
 
 
-def scope_key(rule: Rule) -> str:
-    """Give a canonical text form of a rule's scope, so equal scopes compare equal.
+def rule_to_columns(rule: Rule) -> Dict[str, Any]:
+    """Convert a Rule into column values (without id).
 
     Args:
         rule: The rule.
 
     Returns:
-        Sorted JSON of the scope, with each allowed-values list sorted too.
+        A dict of column name to value, ready to insert or update.
     """
-    normalized = {
-        field: sorted(map(str, values)) for field, values in rule.scope.items()
-    }
-    return json.dumps(normalized, sort_keys=True)
+    columns = {}
+    for name, value in asdict(rule).items():
+        if name == "id":
+            continue
+        if name in JSON_COLUMNS:
+            columns[JSON_COLUMNS[name]] = json.dumps(value)
+        elif name in BOOLEAN_FIELDS:
+            columns[name] = int(bool(value))
+        else:
+            columns[name] = value
+    return columns
 
 
-def condition_fields(rule: Rule) -> frozenset:
-    """List the facts a rule's conditions check.
+def get_rules(status: Optional[str] = RuleStatus.ACTIVE.value) -> List[Rule]:
+    """Read rules, by default only the active ones.
 
     Args:
-        rule: The rule.
+        status: A RuleStatus value, or None for every rule.
 
     Returns:
-        The set of fact names used in its conditions.
+        Rules ordered by id.
     """
-    return frozenset(condition["field"] for condition in rule.conditions)
-
-
-def get_active_rules(domain: Optional[str] = None) -> List[Rule]:
-    """Read active rules, optionally for one domain.
-
-    Args:
-        domain: A RULE_DOMAINS value, or None for every domain.
-
-    Returns:
-        Active rules ordered by id.
-    """
-    query = "SELECT * FROM rules WHERE is_active = 1"
-    params: tuple = ()
-    if domain:
-        query += " AND domain = ?"
-        params = (domain,)
+    query, params = "SELECT * FROM rules", ()
+    if status:
+        query, params = query + " WHERE status = ?", (status,)
     with get_connection() as connection:
         rows = connection.execute(query + " ORDER BY id", params).fetchall()
     return [row_to_rule(row) for row in rows]
 
 
+def get_rule(rule_id: int) -> Optional[Rule]:
+    """Read one rule.
+
+    Args:
+        rule_id: The rule's id.
+
+    Returns:
+        The Rule, or None if there is no such rule.
+    """
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT * FROM rules WHERE id = ?", (rule_id,)
+        ).fetchone()
+    return row_to_rule(row) if row else None
+
+
+def same_coverage_key(rule: Rule) -> str:
+    """Describe which orders and facts a hard rule covers, so overlaps compare equal.
+
+    Args:
+        rule: The rule.
+
+    Returns:
+        Canonical JSON of its categories, scope and checked facts.
+    """
+    return json.dumps(
+        {
+            "routes": sorted(rule.applies_to_routes),
+            "scope": {
+                key: sorted(map(str, values)) for key, values in rule.scope.items()
+            },
+            "facts": sorted(condition["field"] for condition in rule.conditions),
+        },
+        sort_keys=True,
+    )
+
+
 def find_contradicting_rules(rule: Rule) -> List[Rule]:
-    """Find active rules that a new rule would replace.
+    """Find active hard rules that a new hard rule would replace.
 
     Args:
         rule: The new rule, not yet saved.
 
     Returns:
-        Active rules with the same domain, scope and checked facts. Rules without
-        conditions (reminders) never contradict anything.
+        Active hard rules covering the same orders and checking the same facts.
     """
-    fields = condition_fields(rule)
-    if not fields:
+    if rule.rule_type != RuleType.HARD.value or not rule.conditions:
         return []
+    key = same_coverage_key(rule)
     return [
         existing
-        for existing in get_active_rules(rule.domain)
-        if scope_key(existing) == scope_key(rule)
-        and condition_fields(existing) == fields
+        for existing in get_rules()
+        if existing.id != rule.id
+        and existing.rule_type == RuleType.HARD.value
+        and same_coverage_key(existing) == key
     ]
 
 
 def add_rule(rule: Rule) -> int:
-    """Save a new rule, deleting any active rule it contradicts.
-
-    The new rule's version is one higher than the highest version it replaced.
+    """Save a new rule, retiring any active hard rule it contradicts.
 
     Args:
         rule: The rule to save.
@@ -249,32 +410,55 @@ def add_rule(rule: Rule) -> int:
         The new rule's id.
     """
     replaced = find_contradicting_rules(rule)
-    version = max([old.version for old in replaced], default=0) + 1
+    now = utc_now_iso()
+    rule.version = max([old.version for old in replaced], default=0) + 1
+    rule.created_at = rule.created_at or now
+    rule.updated_at = now
+    columns = rule_to_columns(rule)
     with get_connection() as connection:
         for old in replaced:
-            connection.execute("DELETE FROM rules WHERE id = ?", (old.id,))
-            logger.info(
-                "Rule %s (#%s) replaced by new rule %s", old.name, old.id, rule.name
+            connection.execute(
+                "UPDATE rules SET status = ?, updated_at = ? WHERE id = ?",
+                (RuleStatus.RETIRED.value, now, old.id),
             )
+            logger.info("Rule %s (#%s) replaced by %s", old.name, old.id, rule.name)
         cursor = connection.execute(
-            "INSERT INTO rules (name, domain, action, message, scope_json, conditions_json, "
-            "source, owner, version, attachment_path, is_active, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
-            (
-                rule.name,
-                rule.domain,
-                rule.action,
-                rule.message,
-                json.dumps(rule.scope),
-                json.dumps(rule.conditions),
-                rule.source,
-                rule.owner,
-                version,
-                rule.attachment_path,
-                utc_now_iso(),
-            ),
+            f"INSERT INTO rules ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            list(columns.values()),
         )
         return cursor.lastrowid
+
+
+def update_rule(rule_id: int, changes: Dict[str, Any]) -> Rule:
+    """Change some fields of an existing rule and bump its version.
+
+    Args:
+        rule_id: The rule's id.
+        changes: Field name to new value; only EDITABLE_FIELDS are allowed.
+
+    Returns:
+        The updated Rule.
+    """
+    rule = get_rule(rule_id)
+    if rule is None:
+        raise ValueError(f"There is no rule #{rule_id}.")
+    unknown = set(changes) - set(EDITABLE_FIELDS)
+    if unknown:
+        raise ValueError(
+            f"These fields can't be changed: {', '.join(sorted(unknown))}."
+        )
+    for name, value in changes.items():
+        setattr(rule, name, value)
+    rule.version += 1
+    rule.updated_at = utc_now_iso()
+    columns = rule_to_columns(rule)
+    with get_connection() as connection:
+        connection.execute(
+            f"UPDATE rules SET {', '.join(f'{name} = ?' for name in columns)} WHERE id = ?",
+            [*columns.values(), rule_id],
+        )
+    return rule
 
 
 def retire_rule(rule_id: int) -> None:
@@ -287,7 +471,10 @@ def retire_rule(rule_id: int) -> None:
         None.
     """
     with get_connection() as connection:
-        connection.execute("UPDATE rules SET is_active = 0 WHERE id = ?", (rule_id,))
+        connection.execute(
+            "UPDATE rules SET status = ?, updated_at = ? WHERE id = ?",
+            (RuleStatus.RETIRED.value, utc_now_iso(), rule_id),
+        )
 
 
 def seed_default_rules() -> None:
@@ -301,5 +488,5 @@ def seed_default_rules() -> None:
     if has_rules:
         return
     for rule in SEED_RULES:
-        add_rule(rule)
+        add_rule(Rule(**asdict(rule)))
     logger.info("Seeded %d default rules", len(SEED_RULES))

@@ -1,7 +1,7 @@
-"""Service entrypoint: polls Fusion, routes and validates orders, closes released ones.
+"""Service entrypoint: checks Fusion for orders and starts the review workflow for new ones.
 
-Run with `python -m src.app`. It never releases or rejects an order by itself; those
-actions only happen when a MfgOps user clicks a button in the UI (src/ui_layer/app.py).
+Run with `python -m src.app`. It never releases or rejects an order by itself: each
+order's workflow pauses until a MfgOps user clicks a button in the UI (src/ui_layer/app.py).
 """
 
 import threading
@@ -10,8 +10,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict, Optional
 
 from src.integration_layer.fetch_orders_from_fusion import sync_orders
-from src.integration_layer.push_orders_to_b2b import verify_released_orders
-from src.intelligence_layer.order_validation import validate_pending_orders
+from src.intelligence_layer.order_review_workflow import review_new_orders
 from src.knowledge_layer.db import init_db
 from src.knowledge_layer.reference_store import seed_reference_lists
 from src.knowledge_layer.rule_store import seed_default_rules
@@ -51,15 +50,14 @@ def prepare_database() -> None:
 
 
 def run_pipeline_once() -> Dict[str, object]:
-    """Run one cycle: sync orders from Fusion, validate new ones, close released ones.
+    """Run one cycle: fetch orders from Fusion, then review the new and corrected ones.
 
     Returns:
-        A summary: sync counts, number validated, number closed.
+        A summary: Fusion sync counts and the number of orders reviewed.
     """
     sync_counts = sync_orders()
-    validated = validate_pending_orders()
-    closed = verify_released_orders()
-    return {"sync": sync_counts, "validated": validated, "closed": closed}
+    reviewed = review_new_orders()
+    return {"sync": sync_counts, "reviewed": reviewed}
 
 
 def run_healthz_server(port: int) -> None:
@@ -107,9 +105,9 @@ def main() -> None:
         target=run_healthz_server, args=(config.healthz_port,), daemon=True
     ).start()
     logger.info(
-        "Started: FUSION_MODE=%s, LLM %s, polling every %ss, /healthz on :%s",
+        "Started: FUSION_MODE=%s, AI %s, polling every %ss, /healthz on :%s",
         config.fusion_mode,
-        "on" if config.llm_enabled else "off (template explanations)",
+        "on" if config.llm_enabled else "off (fixed rules only)",
         config.poll_interval_seconds,
         config.healthz_port,
     )
