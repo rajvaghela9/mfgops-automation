@@ -4,23 +4,43 @@ Run from the repo root with `make ui` (python -m streamlit run src/ui_layer/app.
 Tabs: Dashboard, Orders to Review, Order Tracker, Rules Assistant, EUS Approval.
 """
 
+import base64
+import json
+import os
+import re
 import uuid
 from datetime import datetime, timezone
+from html import escape, unescape
 from pathlib import Path
 from typing import Optional
 
 import streamlit as st
+from dotenv import load_dotenv
 
 from src.app import prepare_database, run_pipeline_once
-from src.intelligence_layer import rules_assistant
+from src.graph_attachments import (
+    GraphAttachmentRetriever,
+    MAIL_METADATA_FILENAME,
+    acquire_access_token,
+    load_configuration as load_graph_configuration,
+)
+from src.intelligence_layer import eus_document_review, rules_assistant
 from src.intelligence_layer.order_review_workflow import submit_reviewer_decision
 from src.intelligence_layer.rule_checks import find_release_blocker
+from src.send_attachment import (
+    load_send_configuration,
+    send_attachment,
+    send_attachments,
+)
 from src.knowledge_layer import (
+    attachment_store,
     learning_request_store,
+    mail_attachment_store,
     mail_store,
     order_store,
     reference_store,
     rule_store,
+    special_instruction_store,
 )
 from src.utils.config import load_config
 from src.utils.models import (
@@ -61,6 +81,10 @@ FINDING_STYLES = {
     RuleOutcome.HOLD.value: (st.warning, "⏸️"),
     RuleOutcome.WARN.value: (st.info, "⚠️"),
 }
+# Where EUS decisions are forwarded while the EUS workstream is a POC.
+EUS_FORWARD_RECIPIENT = "nkp@infoblox.com"
+EUS_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+EUS_TEXT_SUFFIXES = {".txt", ".csv", ".log", ".json", ".xml"}
 
 
 def label(labels: dict, value: Optional[str]) -> str:
@@ -841,13 +865,650 @@ def render_rules_assistant_tab(reviewer: str) -> None:
     render_rules_and_lists()
 
 
-def render_eus_placeholder_tab() -> None:
-    """Placeholder for the EUS Approval workflow (owned by the EUS workstream).
+def eus_attachment_dir() -> Path:
+    """Find the folder the mailbox downloader saves EUS attachments in.
+
+    Returns:
+        The configured attachment folder (defaults to "attachments").
+    """
+    load_dotenv(dotenv_path=Path.cwd() / ".env")
+    return (
+        Path(os.environ.get("ATTACHMENT_OUTPUT_DIR", "attachments"))
+        .expanduser()
+        .resolve()
+    )
+
+
+def list_eus_attachments() -> list:
+    """List the EUS attachments downloaded from the shared mailbox.
+
+    Returns:
+        The attachment files, newest first.
+    """
+    folder = eus_attachment_dir()
+    attachment_store.migrate_files(folder)
+    attachment_store.materialize_attachments(folder)
+    if not folder.is_dir():
+        return []
+    files = [
+        path
+        for path in folder.rglob("*")
+        if path.is_file()
+        and not any(part.startswith(".") for part in path.relative_to(folder).parts)
+    ]
+    return sorted(files, key=lambda path: path.stat().st_mtime, reverse=True)
+
+
+def handle_eus_fetch() -> None:
+    """Download the newest EUS attachments from the shared mailbox.
+
+    Returns:
+        None. The outcome is kept for the next redraw to show.
+    """
+    output_dir = None
+    known = {
+        path.resolve().relative_to(eus_attachment_dir()).as_posix()
+        for path in list_eus_attachments()
+    }
+    try:
+        # This tab can run before anything else has read .env.
+        load_dotenv()
+        config = load_graph_configuration()
+        access_token = acquire_access_token(
+            config["tenant_id"], config["client_id"], config["client_secret"]
+        )
+        output_dir = Path(config["output_dir"]).expanduser().resolve()
+        retriever = GraphAttachmentRetriever(access_token)
+        downloaded = []
+        for sender_email in config["sender_emails"]:
+            processed_message_ids = (
+                mail_attachment_store.get_processed_message_ids(
+                    config["mailbox"], sender_email
+                )
+            )
+            downloaded += retriever.download_sender_attachments(
+                config["mailbox"],
+                sender_email,
+                output_dir,
+                processed_message_ids=processed_message_ids,
+                on_message_processed=lambda message, sender=sender_email: (
+                    mail_attachment_store.record_processed_message(
+                        message["id"],
+                        config["mailbox"],
+                        sender,
+                        message["receivedDateTime"],
+                    )
+                ),
+            )
+    except Exception as error:
+        st.session_state["flash_error"] = f"Could not check the mailbox: {error}"
+        return
+    fresh = [
+        path
+        for path in downloaded
+        if path.resolve().relative_to(output_dir).as_posix() not in known
+    ]
+    reviewed = 0
+    review_failures = 0
+    for folder_path in sorted({path.resolve().parent for path in fresh}):
+        if folder_path == output_dir:
+            continue
+        folder_name = folder_path.relative_to(output_dir).as_posix()
+        folder_files = [
+            path for path in folder_path.iterdir() if path.is_file()
+        ]
+        perform_eus_review(folder_name, folder_files)
+        reviewed += 1
+        if f"eus_automated_review_{folder_name}_error" in st.session_state:
+            review_failures += 1
+    if fresh:
+        st.session_state["flash_message"] = (
+            f"{len(fresh)} new EUS attachment(s) downloaded from the mailbox to "
+            f"{output_dir}. Automated verification ran for {reviewed} email(s)"
+            + (
+                f" and reported {review_failures} error(s)."
+                if review_failures
+                else "."
+            )
+        )
+    else:
+        st.session_state["flash_message"] = (
+            f"No new EUS attachments. {len(downloaded)} already downloaded "
+            f"in {output_dir}."
+        )
+
+
+def handle_eus_decision(relative_path: str, decision: str, reviewer: str) -> None:
+    """Forward one EUS attachment with the reviewer's decision and comments.
+
+    Args:
+        relative_path: Attachment path relative to the download folder.
+        decision: Either "approve" or "reject".
+        reviewer: Name of the MfgOps user.
+
+    Returns:
+        None. The outcome is kept for the next redraw to show.
+    """
+    file_name = Path(relative_path).name
+    comment = st.session_state.get(f"eus_comment_{relative_path}", "").strip()
+    if decision == "reject" and not comment:
+        st.session_state["flash_error"] = (
+            f"{file_name}: add a comment before rejecting."
+        )
+        return
+    attachment_root = eus_attachment_dir()
+    attachment_path = (attachment_root / relative_path).resolve()
+    if attachment_root not in attachment_path.parents:
+        st.session_state["flash_error"] = f"{file_name}: invalid attachment path."
+        return
+    if not attachment_path.is_file():
+        st.session_state["flash_error"] = f"{file_name} is no longer available."
+        return
+    verdict = "Approved" if decision == "approve" else "Rejected"
+    body = [f"EUS review outcome: {verdict}."]
+    if reviewer:
+        body.append(f"Reviewed by: {reviewer}.")
+    if comment:
+        body += ["", "Comments:", comment]
+    try:
+        config = load_send_configuration()
+        access_token = acquire_access_token(
+            config["tenant_id"], config["client_id"], config["client_secret"]
+        )
+        send_attachment(
+            access_token,
+            config["mailbox"],
+            EUS_FORWARD_RECIPIENT,
+            f"EUS {verdict}: {file_name}",
+            "\n".join(body),
+            attachment_path,
+        )
+    except Exception as error:
+        st.session_state["flash_error"] = f"{file_name}: could not forward — {error}"
+        return
+    attachment_store.record_decision(relative_path, decision, reviewer, comment)
+    st.session_state["flash_message"] = (
+        f"{file_name} was {verdict.lower()} and forwarded to {EUS_FORWARD_RECIPIENT}."
+    )
+
+
+def render_eus_preview(attachment_path: Path) -> None:
+    """Show the attachment in the page so the reviewer can read it here.
+
+    Args:
+        attachment_path: The downloaded attachment.
 
     Returns:
         None.
     """
-    st.info("EUS Approval is coming soon (EUS workstream).")
+    suffix = attachment_path.suffix.lower()
+    content = attachment_path.read_bytes()
+    if suffix == ".pdf":
+        encoded = base64.b64encode(content).decode("ascii")
+        st.markdown(
+            f'<iframe src="data:application/pdf;base64,{encoded}" width="100%" '
+            'height="600" title="EUS attachment"></iframe>',
+            unsafe_allow_html=True,
+        )
+    elif suffix in EUS_IMAGE_SUFFIXES:
+        st.image(content)
+    elif suffix in EUS_TEXT_SUFFIXES:
+        st.text(content.decode("utf-8", errors="replace")[:5000])
+    else:
+        st.caption("No preview for this file type — use Download to open it.")
+
+
+def mail_received_label(folder_name: str) -> Optional[str]:
+    """Read the UTC mail arrival timestamp from a downloaded mail folder name.
+
+    Args:
+        folder_name: Name of the per-email folder, e.g. "20261015_121500_AAMk".
+
+    Returns:
+        A readable UTC timestamp, or None when the name carries no timestamp.
+    """
+    match = re.match(r"^(\d{8}_\d{6})(?:_|$)", folder_name)
+    if not match:
+        return None
+    try:
+        received_at = datetime.strptime(match.group(1), "%Y%m%d_%H%M%S").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+    return received_at.strftime("%d %b %Y, %H:%M:%S UTC")
+
+
+def group_eus_attachments_by_mail(attachments: list) -> list:
+    """Group downloaded attachments by the per-email folder they were saved in.
+
+    Args:
+        attachments: Attachment files, newest first.
+
+    Returns:
+        A list of (folder_name, received_label, files) tuples, newest mail first.
+        Files saved before per-email folders existed are grouped last under a
+        None folder name.
+    """
+    root = eus_attachment_dir()
+    groups: dict = {}
+    for path in attachments:
+        parts = path.relative_to(root).parts
+        folder_name = parts[0] if len(parts) > 1 else None
+        groups.setdefault(folder_name, []).append(path)
+    mail_groups = [
+        (folder_name, mail_received_label(folder_name or ""), files)
+        for folder_name, files in groups.items()
+        if folder_name is not None
+    ]
+    mail_groups.sort(key=lambda group: group[0], reverse=True)
+    if None in groups:
+        mail_groups.append((None, None, groups[None]))
+    return mail_groups
+
+
+def load_mail_metadata(folder_name: str) -> Optional[dict]:
+    """Read the saved subject and body for one downloaded email."""
+    root = eus_attachment_dir()
+    folder = (root / folder_name).resolve()
+    if root not in folder.parents:
+        return None
+    metadata_path = folder / MAIL_METADATA_FILENAME
+    if not metadata_path.is_file():
+        return None
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return metadata if isinstance(metadata, dict) else None
+
+
+def mail_body_preview(metadata: dict) -> str:
+    """Convert an HTML or text email body into readable plain text for the UI."""
+    body = str(metadata.get("body") or "")
+    if str(metadata.get("body_content_type") or "").lower() == "html":
+        body = re.sub(r"<[^>]+>", " ", body)
+        body = unescape(body)
+    return re.sub(r"\s+", " ", body).strip()
+
+
+def handle_special_instruction_share(folder_name: str, reviewer: str) -> None:
+    """Share an email body with its PO, Quote, and approved EUS attachments."""
+    root = eus_attachment_dir()
+    folder = (root / folder_name).resolve()
+    if root not in folder.parents or not folder.is_dir():
+        st.session_state["flash_error"] = "The email folder is no longer available."
+        return
+    metadata = load_mail_metadata(folder_name)
+    if not metadata or not str(metadata.get("body") or "").strip():
+        st.session_state["flash_error"] = (
+            "The original email body is unavailable, so its special instructions "
+            "cannot be shared."
+        )
+        return
+    review = st.session_state.get(f"eus_automated_review_{folder_name}")
+    if review is None:
+        st.session_state["flash_error"] = (
+            "Run the automated document classification before sharing this email."
+        )
+        return
+    files = sorted(
+        (
+            path
+            for path in folder.iterdir()
+            if path.is_file() and not path.name.startswith(".")
+        ),
+        key=lambda path: path.name.lower(),
+    )
+    eus_files = [
+        path
+        for path in files
+        if review.document_types.get(path.name) == "eus"
+    ]
+    unapproved = [
+        path.name
+        for path in eus_files
+        if (
+            attachment_store.get_decision(path.relative_to(root).as_posix()) or {}
+        ).get("decision")
+        != "approve"
+    ]
+    if unapproved:
+        st.session_state["flash_error"] = (
+            "Approve the EUS before sharing the special instructions: "
+            + ", ".join(unapproved)
+        )
+        return
+    body_type = str(metadata.get("body_content_type") or "text")
+    original_body = str(metadata.get("body") or "")
+    if body_type.lower() == "html":
+        body = (
+            f"<p><strong>Shared by {escape(reviewer or 'MfgOps reviewer')}.</strong></p>"
+            f"<hr>{original_body}"
+        )
+    else:
+        body = (
+            f"Shared by {reviewer or 'MfgOps reviewer'}.\n\n"
+            f"{original_body}"
+        )
+    subject = str(metadata.get("subject") or "Special instructions")
+    try:
+        config = load_send_configuration()
+        access_token = acquire_access_token(
+            config["tenant_id"], config["client_id"], config["client_secret"]
+        )
+        send_attachments(
+            access_token,
+            config["mailbox"],
+            EUS_FORWARD_RECIPIENT,
+            f"Special instructions: {subject}",
+            body,
+            files,
+            body_content_type=body_type,
+        )
+    except Exception as error:
+        st.session_state["flash_error"] = (
+            f"Could not share the special instructions: {error}"
+        )
+        return
+    special_instruction_store.record_share(
+        folder_name, EUS_FORWARD_RECIPIENT, reviewer
+    )
+    st.session_state["flash_message"] = (
+        f"Special instructions and {len(files)} attachment(s) were shared with "
+        f"{EUS_FORWARD_RECIPIENT}."
+    )
+
+
+def render_special_instruction_share(
+    folder_name: str,
+    review: Optional[eus_document_review.EusReview],
+    reviewer: str,
+) -> None:
+    """Show the original instructions and their mail-level sharing action."""
+    metadata = load_mail_metadata(folder_name)
+    if not metadata or not str(metadata.get("body") or "").strip():
+        return
+    st.markdown("#### Special instructions")
+    subject = str(metadata.get("subject") or "(no subject)")
+    sender = str(metadata.get("sender_email") or "unknown sender")
+    st.caption(f"Original email: {subject} · From {sender}")
+    preview = mail_body_preview(metadata)
+    with st.expander("View original email instructions"):
+        st.write(preview or "The email body is empty.")
+
+    shared = special_instruction_store.get_share(folder_name)
+    if shared:
+        st.success(
+            f"Shared with {shared['recipient']} by "
+            f"{shared['shared_by'] or 'unknown'} at {shared['shared_at']}."
+        )
+        return
+
+    disabled_reason = ""
+    if review is None:
+        disabled_reason = "Run automated document classification first."
+    else:
+        eus_names = [
+            file_name
+            for file_name, document_type in review.document_types.items()
+            if document_type == "eus"
+        ]
+        unapproved = [
+            file_name
+            for file_name in eus_names
+            if (
+                attachment_store.get_decision(
+                    (Path(folder_name) / file_name).as_posix()
+                )
+                or {}
+            ).get("decision")
+            != "approve"
+        ]
+        if unapproved:
+            disabled_reason = "Approve the EUS before sharing this package."
+        elif eus_names:
+            st.info(
+                "The approved EUS will be shared with the special instructions, "
+                "PO, and Quote."
+            )
+        else:
+            st.info(
+                "No EUS was identified. The special instructions, PO, and Quote "
+                "can be shared without an EUS."
+            )
+    st.button(
+        "📤 Share special instructions",
+        key=f"share_special_instructions_{folder_name}",
+        disabled=not reviewer or bool(disabled_reason),
+        on_click=handle_special_instruction_share,
+        args=(folder_name, reviewer),
+        width="stretch",
+    )
+    if disabled_reason:
+        st.caption(disabled_reason)
+
+
+def render_eus_mail_group(
+    folder_name: Optional[str],
+    received_label: Optional[str],
+    files: list,
+    reviewer: str,
+) -> None:
+    """Show one email as a heading with every attachment that came with it.
+
+    Args:
+        folder_name: Name of the per-email folder, or None for older downloads.
+        received_label: Readable UTC arrival time, or None when unknown.
+        files: Attachments saved in that folder.
+        reviewer: Name of the MfgOps user ("" disables the buttons).
+
+    Returns:
+        None.
+    """
+    if folder_name is None:
+        st.subheader("📁 Earlier downloads (not grouped by email)")
+    elif received_label:
+        st.subheader(f"📧 Email received {received_label}")
+        st.caption(f"{len(files)} attachment(s) in {folder_name}/")
+    else:
+        st.subheader(f"📧 {folder_name}")
+        st.caption(f"{len(files)} attachment(s)")
+    review = (
+        render_eus_automated_review(folder_name, files)
+        if folder_name is not None
+        else None
+    )
+    for attachment_path in files:
+        document_type = (
+            review.document_types.get(attachment_path.name) if review else None
+        )
+        render_eus_attachment_card(attachment_path, reviewer, document_type)
+    if folder_name is not None:
+        render_special_instruction_share(folder_name, review, reviewer)
+    st.divider()
+
+
+def render_eus_automated_review(
+    folder_name: str, files: list
+) -> Optional[eus_document_review.EusReview]:
+    """Show automated checks for one email's document set."""
+    state_key = f"eus_automated_review_{folder_name}"
+    error_key = f"{state_key}_error"
+    if st.button(
+        "🔄 Re-run automated EUS checks",
+        key=f"run_{state_key}",
+        width="stretch",
+    ):
+        perform_eus_review(folder_name, files)
+
+    error = st.session_state.get(error_key)
+    if error:
+        st.error(f"Automated EUS review could not run: {error}")
+        st.caption("A reviewer may still inspect the files and make a manual decision.")
+        return None
+
+    review = st.session_state.get(state_key)
+    if review is None:
+        st.info(
+            "Automated verification has not completed for this email. Use the "
+            "re-run button to try again."
+        )
+        return None
+
+    if review.passed:
+        st.success("All automated EUS checks passed.")
+    else:
+        st.warning(
+            "One or more automated checks failed. Review the details before overriding."
+        )
+        failed_checks = [check for check in review.checks if not check.passed]
+        st.error(
+            "**Failed checks:**\n\n"
+            + "\n".join(
+                f"- **{check.label}** — {check.details}" for check in failed_checks
+            )
+        )
+    if review.document_types:
+        identified = ", ".join(
+            f"{file_name}: {document_type.upper()}"
+            for file_name, document_type in review.document_types.items()
+        )
+        st.caption(f"Identified documents — {identified}")
+    for check in review.checks:
+        marker = "✅" if check.passed else "❌"
+        st.markdown(f"{marker} **{check.label}** — {check.details}")
+    return review
+
+
+def perform_eus_review(folder_name: str, files: list) -> None:
+    """Run and store automated checks for one downloaded email folder."""
+    state_key = f"eus_automated_review_{folder_name}"
+    error_key = f"{state_key}_error"
+    st.session_state.pop(error_key, None)
+    try:
+        with st.spinner("Reading and comparing the EUS, quote, and PO..."):
+            st.session_state[state_key] = (
+                eus_document_review.review_mail_documents(files)
+            )
+    except eus_document_review.EusReviewError as error:
+        st.session_state.pop(state_key, None)
+        st.session_state[error_key] = str(error)
+
+
+def render_eus_attachment_card(
+    attachment_path: Path,
+    reviewer: str,
+    document_type: Optional[str] = None,
+) -> None:
+    """Show one EUS attachment with its preview and the decision buttons.
+
+    Args:
+        attachment_path: The downloaded attachment.
+        reviewer: Name of the MfgOps user ("" disables the buttons).
+
+    Returns:
+        None.
+    """
+    file_name = attachment_path.name
+    relative_path = attachment_path.relative_to(eus_attachment_dir()).as_posix()
+    saved_decision = attachment_store.get_decision(relative_path)
+    decided = None
+    if saved_decision:
+        decided = {
+            "verdict": (
+                "Approved" if saved_decision["decision"] == "approve" else "Rejected"
+            ),
+            "comment": saved_decision["comment"],
+            "reviewer": saved_decision["decided_by"],
+        }
+    icon = "📄" if not decided else ("✅" if decided["verdict"] == "Approved" else "⛔")
+    title = f"{icon} {file_name}"
+    if decided:
+        title += f" · {decided['verdict']}"
+    with st.expander(title):
+        st.caption(f"{attachment_path.stat().st_size / 1024:,.0f} KB")
+        st.download_button(
+            "⬇️ Download",
+            data=attachment_path.read_bytes(),
+            file_name=file_name,
+            key=f"eus_download_{relative_path}",
+            width="stretch",
+        )
+        render_eus_preview(attachment_path)
+        st.divider()
+        if decided:
+            st.success(
+                f"{decided['verdict']} by {decided['reviewer'] or 'unknown'} and "
+                f"forwarded to {EUS_FORWARD_RECIPIENT}."
+            )
+            if decided["comment"]:
+                st.write(decided["comment"])
+            return
+        if document_type in {"quote", "po", "other"}:
+            st.info(
+                f"This {document_type.upper()} is supporting evidence for the "
+                "email-level EUS checks and does not need a separate decision."
+            )
+            return
+        with st.form(key=f"eus_decision_{relative_path}"):
+            st.text_area(
+                "Your comment (needed when rejecting)",
+                key=f"eus_comment_{relative_path}",
+                placeholder="e.g. the EUS is missing the end customer's signature",
+            )
+            approve, reject = st.columns(2)
+            approve.form_submit_button(
+                "✅ Approve & forward",
+                disabled=not reviewer,
+                width="stretch",
+                on_click=handle_eus_decision,
+                args=(relative_path, "approve", reviewer),
+            )
+            reject.form_submit_button(
+                "⛔ Reject & forward",
+                disabled=not reviewer,
+                width="stretch",
+                on_click=handle_eus_decision,
+                args=(relative_path, "reject", reviewer),
+            )
+        if not reviewer:
+            st.caption("Enter your name in the sidebar to enable the buttons.")
+
+
+def render_eus_approval_tab(reviewer: str) -> None:
+    """Show the EUS attachments from the mailbox and approve or reject them.
+
+    Args:
+        reviewer: Name of the MfgOps user.
+
+    Returns:
+        None.
+    """
+    show_flash_messages()
+    st.caption(
+        "Attachments are grouped by the email they arrived in; each email has its "
+        "own timestamped folder. Approving or rejecting forwards the attachment to "
+        f"{EUS_FORWARD_RECIPIENT}."
+    )
+    st.button(
+        "📥 Check mailbox for new EUS attachments",
+        on_click=handle_eus_fetch,
+        width="stretch",
+    )
+    attachments = list_eus_attachments()
+    if not attachments:
+        st.info(
+            "No EUS attachments yet. Use the button above to check the mailbox."
+        )
+        return
+    groups = group_eus_attachments_by_mail(attachments)
+    st.caption(
+        f"{len(attachments)} attachment(s) from {len(groups)} email(s) "
+        f"in {eus_attachment_dir()}/"
+    )
+    for folder_name, received_label, files in groups:
+        render_eus_mail_group(folder_name, received_label, files, reviewer)
 
 
 def main() -> None:
@@ -890,7 +1551,7 @@ def main() -> None:
     with tabs[3]:
         render_rules_assistant_tab(reviewer)
     with tabs[4]:
-        render_eus_placeholder_tab()
+        render_eus_approval_tab(reviewer)
 
 
 if __name__ == "__main__":

@@ -39,6 +39,40 @@ LIST_LABELS = {
 }
 
 CONFIRM = "seed — confirm with Jennifer"
+EUS_WORKBOOK_SOURCE = "EUS Countries v3.0 — 01 August 2022"
+REQUIRED_EUS_COUNTRIES = {
+    "AF": ("Afghanistan", EUS_WORKBOOK_SOURCE),
+    "AM": ("Armenia", EUS_WORKBOOK_SOURCE),
+    "AZ": ("Azerbaijan", EUS_WORKBOOK_SOURCE),
+    "CF": ("Central African Republic", EUS_WORKBOOK_SOURCE),
+    "CD": ("Democratic Republic of the Congo", EUS_WORKBOOK_SOURCE),
+    "CN": ("China", EUS_WORKBOOK_SOURCE),
+    "ER": ("Eritrea", EUS_WORKBOOK_SOURCE),
+    "GE": ("Georgia", EUS_WORKBOOK_SOURCE),
+    "HK": ("Hong Kong (with import licence)", EUS_WORKBOOK_SOURCE),
+    "IQ": ("Iraq", EUS_WORKBOOK_SOURCE),
+    "KH": ("Cambodia", EUS_WORKBOOK_SOURCE),
+    "KG": ("Kyrgyzstan", EUS_WORKBOOK_SOURCE),
+    "KR": ("South Korea", "MfgOps requirement — 22 October 2026"),
+    "KZ": ("Kazakhstan", EUS_WORKBOOK_SOURCE),
+    "LA": ("Laos", EUS_WORKBOOK_SOURCE),
+    "LB": ("Lebanon", EUS_WORKBOOK_SOURCE),
+    "LY": ("Libya", EUS_WORKBOOK_SOURCE),
+    "MD": ("Moldova", EUS_WORKBOOK_SOURCE),
+    "MN": ("Mongolia", EUS_WORKBOOK_SOURCE),
+    "MO": ("Macau", EUS_WORKBOOK_SOURCE),
+    "PK": ("Pakistan", EUS_WORKBOOK_SOURCE),
+    "SD": ("Sudan", EUS_WORKBOOK_SOURCE),
+    "SO": ("Somalia", EUS_WORKBOOK_SOURCE),
+    "SS": ("South Sudan", EUS_WORKBOOK_SOURCE),
+    "TJ": ("Tajikistan", EUS_WORKBOOK_SOURCE),
+    "TM": ("Turkmenistan", EUS_WORKBOOK_SOURCE),
+    "UA": ("Ukraine", EUS_WORKBOOK_SOURCE),
+    "UZ": ("Uzbekistan", EUS_WORKBOOK_SOURCE),
+    "VN": ("Vietnam", EUS_WORKBOOK_SOURCE),
+    "YE": ("Yemen", EUS_WORKBOOK_SOURCE),
+    "ZW": ("Zimbabwe", EUS_WORKBOOK_SOURCE),
+}
 RULES_THREAD = "Raj/Jennifer rules thread, 30 Sep 2026"
 CORD_TABLE = RULES_THREAD + " (power cord table)"
 CONTINENTAL_EU = [
@@ -46,12 +80,7 @@ CONTINENTAL_EU = [
     "LV", "LT", "LU", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE",
 ]  # fmt: skip
 SEED_REFERENCE_LISTS = {
-    EUS_COUNTRIES: {
-        "CN": ("China", "Infoblox EUS list"),
-        "HK": ("Hong Kong (with import licence)", "Infoblox EUS list"),
-        "IQ": ("Iraq", "Infoblox EUS list"),
-        "SD": ("Sudan", "Arrow EUS list"),
-    },
+    EUS_COUNTRIES: REQUIRED_EUS_COUNTRIES,
     SPECIAL_INSTRUCTION_COUNTRIES: {
         "AE": ("UAE: blue-ink sign and stamp", "Jennifer"),
         "QA": ("Qatar: blue-ink sign and stamp", "Jennifer"),
@@ -246,7 +275,9 @@ def delete_reference_value(list_name: str, key: str) -> None:
 def seed_reference_lists() -> None:
     """Fill each list that has no entries yet with its seed values.
 
-    Lists that already have entries are left alone, so user edits and deletions stick.
+    Lists that already have entries are left alone, so user edits and deletions
+    stick. Mandatory EUS countries are always backfilled because omitting one
+    could allow an order to bypass the required document check.
 
     Returns:
         None.
@@ -254,6 +285,15 @@ def seed_reference_lists() -> None:
     now = utc_now_iso()
     with get_connection() as connection:
         for list_name, entries in SEED_REFERENCE_LISTS.items():
+            if list_name == EUS_COUNTRIES:
+                for key, (value, source) in entries.items():
+                    connection.execute(
+                        "INSERT OR IGNORE INTO reference_lists "
+                        "(list_name, item_key, item_value, source, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (list_name, key, value, source, now),
+                    )
+                continue
             already_filled = connection.execute(
                 "SELECT 1 FROM reference_lists WHERE list_name = ? LIMIT 1",
                 (list_name,),

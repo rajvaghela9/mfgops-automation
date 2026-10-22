@@ -171,3 +171,122 @@ explaining what's missing; the mail mode needs none of it:
 
 `make lint` (black + flake8) and `make test` (pytest). Tests use a temp database, never call
 Fusion, and replace the AI with canned replies.
+
+## Retrieve mailbox attachments
+
+`src.graph_attachments` downloads attachments from messages sent by configured
+addresses. It uses Microsoft Graph app-only authentication. The app registration
+needs the Microsoft Graph **Mail.Read** application permission with admin
+consent, and its credentials must be allowed to access the target mailbox.
+
+Set these environment variables before running the command:
+
+| Variable | Description |
+| --- | --- |
+| `GRAPH_TENANT_ID` | Microsoft Entra tenant ID |
+| `GRAPH_CLIENT_ID` | App registration client ID |
+| `GRAPH_CLIENT_SECRET` | App registration client secret |
+| `GRAPH_MAILBOX` | Mailbox address or user ID to search |
+| `GRAPH_SENDER_EMAILS` | Comma-separated sender email addresses |
+| `ATTACHMENT_OUTPUT_DIR` | Destination directory; defaults to `attachments` |
+
+Copy `.env.example` to `.env` and fill it in locally. `.env` is ignored by Git
+so app secrets are not committed. Install runtime dependencies with
+`pip install -r requirements.txt`, then run:
+
+```sh
+python -m src.graph_attachments
+```
+
+Each email gets its own folder under the configured output directory. The
+folder name contains the email's UTC received timestamp and message ID, for
+example `20261015_121500_AAMk.../`, and holds the real file attachments from
+that email. Inline body resources such as signature logos and icons are
+ignored, including Graph file attachments that are marked with a content ID or
+use common body-resource names such as `image001.png` or `img-<uuid>.png`.
+
+Reference attachments are the one exception: they are links to files in
+OneDrive or SharePoint rather than real files, so Microsoft Graph serves no
+content for them and there is nothing to save.
+
+Successfully checked Graph message IDs are recorded in the
+`processed_mail_messages` table in `DB_PATH`. Later mailbox checks skip those
+messages instead of downloading historical attachments again. Deleting files
+from the attachment folder does not delete this processing history.
+
+When an email body contains a `Special instruction(s):` or
+`Shipping instruction(s):` marker, the downloader extracts only the text
+following that marker, stopping before signatures and forwarded-message
+headers. It saves that extracted section—not the complete email body—as hidden
+metadata in the email's timestamped folder. Bodies without either marker are
+not retained. The EUS Approval tab displays the extracted section under
+**Special instructions**:
+
+- when no EUS is identified, a reviewer can share the instructions with the PO
+  and Quote attachments;
+- when an EUS is identified, sharing stays disabled until that EUS is approved,
+  then the instructions, PO, Quote, and verified EUS are sent together;
+- the `shared_mail_packages` table records who shared each email package and
+  prevents an accidental duplicate share from the UI.
+
+Order routing uses the Infoblox-required countries from **EUS Countries v3.0 —
+01 August 2022**. China (`CN`), Hong Kong (`HK`), and South Korea (`KR`) are
+therefore routed through the EUS workflow and held until an approved EUS is
+linked. North Korea (`KP`) remains an embargoed destination and cannot be
+released.
+
+When an EUS attachment is approved or rejected in the UI, the outcome,
+reviewer, comment, attachment path, and decision time are stored in the
+`attachment_decisions` table in `DB_PATH` (default `data/mfgops.db`).
+
+Downloaded mailbox attachment bytes and metadata are stored in the
+`mailbox_attachments` table in the same SQLite database. The `attachments/`
+directory is a materialized cache used by the document preview and review
+flows; deleting a cached file does not delete the SQLite copy, and the UI
+restores it from SQLite when it next loads.
+
+### Automated EUS checks
+
+For each newly downloaded timestamped email folder, the application automatically
+extracts and compares text-searchable PDF attachments. The **EUS Approval** tab
+shows the results and provides a **Re-run automated EUS checks** control when a
+manual rerun is needed:
+
+- identify one EUS and at least one supporting PO or Quote; each supporting
+  document is optional when the other is present;
+- compare the EUS quote number, quantity, part, and partner SKU wherever they
+  appear against the available PO and/or Quote; a match with either one passes;
+- require **No** for question 6 wherever it appears in the EUS;
+- require a signer title of manager or higher;
+- validate the signer email format and require at least one document or
+  signature date;
+- accept a clearly visible handwritten/electronic signature on a scanned EUS,
+  or verify that an embedded PDF signature is cryptographically intact and
+  valid. A visible signature is treated as present but is not falsely described
+  as cryptographically authenticated.
+
+Every check is shown as pass or fail. A reviewer can still override a failed or
+unverified automated result and approve manually. The extractor requires the
+LiteLLM settings. Text-searchable pages are sent as text; scanned pages are
+rendered locally and sent as page images for visual extraction.
+
+## Send an attachment with comments
+
+`src.send_attachment` sends one file from `GRAPH_MAILBOX` using Microsoft
+Graph. The app registration needs the **Mail.Send** application permission with
+admin consent in addition to the permissions used for downloading.
+
+Provide the recipient, attachment, and subject on the command line:
+
+```sh
+python -m src.send_attachment \
+  --recipient recipient@example.com \
+  --attachment attachments/20261015_121500_AAMk.../invoice.pdf \
+  --subject "Invoice review"
+```
+
+The command then prompts for comments. Enter one or more lines and finish with a
+line containing only `.`. Successfully accepted messages are saved in the
+mailbox's Sent Items folder. Attachments under 3 MB are sent in a single
+request; larger ones are uploaded in chunks through a Microsoft Graph upload
+session, up to the Graph ceiling of 150 MB.

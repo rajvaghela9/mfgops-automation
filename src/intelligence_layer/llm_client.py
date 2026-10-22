@@ -39,6 +39,8 @@ def describe_failure(error: Exception) -> str:
         )
     if status == 401:
         return "the AI server rejected the API key (LITELLM_API_KEY in .env)"
+    if status == 413:
+        return "the AI request was too large for the LiteLLM proxy"
     if isinstance(error, (openai.APIConnectionError, openai.APITimeoutError)):
         return "could not reach the AI server. Check your network or VPN connection"
     return " ".join(str(error).split())[:200]

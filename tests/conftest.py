@@ -28,6 +28,7 @@ def isolated_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
     monkeypatch.setenv("WORKFLOW_DB_PATH", str(tmp_path / "workflow.db"))
     monkeypatch.setenv("ATTACHMENTS_DIR", str(tmp_path / "attachments"))
+    monkeypatch.setenv("ATTACHMENT_OUTPUT_DIR", str(tmp_path / "eus_attachments"))
     monkeypatch.setenv("OUTBOX_DIR", str(tmp_path / "outbox"))
     monkeypatch.setenv("FUSION_MODE", "mock")
     monkeypatch.setenv("EMAIL_MODE", "mock")

@@ -55,6 +55,49 @@ CREATE TABLE IF NOT EXISTS order_decisions (
     ai_verdict_at_time TEXT, agreed INTEGER, created_at TEXT
 );
 
+-- Latest reviewer outcome for each downloaded mailbox attachment.
+CREATE TABLE IF NOT EXISTS attachment_decisions (
+    attachment_path TEXT PRIMARY KEY,
+    decision TEXT NOT NULL CHECK (decision IN ('approve', 'reject')),
+    decided_by TEXT NOT NULL,
+    comment TEXT,
+    decided_at TEXT NOT NULL
+);
+
+-- The authoritative content and metadata for downloaded mailbox attachments.
+CREATE TABLE IF NOT EXISTS mailbox_attachments (
+    message_id TEXT NOT NULL,
+    attachment_id TEXT NOT NULL,
+    mailbox TEXT NOT NULL,
+    sender_email TEXT NOT NULL,
+    folder_name TEXT NOT NULL,
+    relative_path TEXT NOT NULL UNIQUE,
+    file_name TEXT NOT NULL,
+    content_type TEXT,
+    file_size INTEGER NOT NULL,
+    content BLOB NOT NULL,
+    received_at TEXT NOT NULL,
+    stored_at TEXT NOT NULL,
+    PRIMARY KEY (message_id, attachment_id)
+);
+
+-- Messages already checked for attachments, so mailbox polling is idempotent.
+CREATE TABLE IF NOT EXISTS processed_mail_messages (
+    message_id TEXT PRIMARY KEY,
+    mailbox TEXT NOT NULL,
+    sender_email TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    processed_at TEXT NOT NULL
+);
+
+-- One outbound package per special-instruction email folder.
+CREATE TABLE IF NOT EXISTS shared_mail_packages (
+    folder_name TEXT PRIMARY KEY,
+    recipient TEXT NOT NULL,
+    shared_by TEXT NOT NULL,
+    shared_at TEXT NOT NULL
+);
+
 -- One row per order ever seen, kept forever. Feeds the Dashboard.
 CREATE TABLE IF NOT EXISTS all_orders (
     order_no TEXT PRIMARY KEY,
