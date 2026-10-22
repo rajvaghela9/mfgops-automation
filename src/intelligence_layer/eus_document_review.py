@@ -190,6 +190,14 @@ def _normalise_identifier(value: Any) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
 
 
+def _normalise_quote_number(value: Any) -> str:
+    """Normalize quote formatting while preserving alphanumeric identifiers."""
+    identifier = _normalise_identifier(value)
+    if identifier.isdigit():
+        return identifier.lstrip("0") or "0"
+    return identifier
+
+
 def _normalise_quantity(value: Any) -> str:
     try:
         return str(Decimal(str(value).replace(",", "")).normalize())
@@ -242,8 +250,8 @@ def _comparison_check(
 ) -> EusCheck:
     if eus is None or source is None:
         return EusCheck(code, label, False, "The required documents were not identified.")
-    eus_quote = _normalise_identifier(eus.get("quote_number"))
-    source_quote = _normalise_identifier(source.get("quote_number"))
+    eus_quote = _normalise_quote_number(eus.get("quote_number"))
+    source_quote = _normalise_quote_number(source.get("quote_number"))
     eus_lines = _normalise_lines(eus)
     source_lines = _normalise_lines(source)
     quote_matches = bool(

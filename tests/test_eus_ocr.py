@@ -141,6 +141,25 @@ def test_order_number_is_ignored_when_quote_number_matches():
     assert review.passed
 
 
+def test_quote_number_ignores_hash_and_leading_zero_formatting():
+    eus = valid_eus()
+    eus["quote_number"] = "#49045"
+    quote = supporting_document("quote", quote_number="00049045")
+
+    review = evaluate_document_facts(
+        [eus, quote],
+        (True, "Valid signature."),
+    )
+
+    comparison = next(
+        check
+        for check in review.checks
+        if check.code == "supporting-document-details"
+    )
+    assert comparison.passed
+    assert review.passed
+
+
 def test_eus_requires_at_least_one_po_or_quote():
     review = evaluate_document_facts(
         [valid_eus()],
