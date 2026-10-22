@@ -2,9 +2,10 @@
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 
 @dataclass
@@ -60,14 +61,28 @@ def read_setting(name: str, default: Optional[str] = None) -> Optional[str]:
 
 
 def load_config() -> Config:
-    """Load settings from .env (if present) and the environment.
+    """Load settings from the environment, .env, and .env.example.
 
-    Variables already set in the environment win over values in .env.
+    Variables already present in the process environment win. The local .env
+    file is loaded next, then any still-missing values are supplemented from
+    .env.example.
 
     Returns:
         A Config with defaults filled in (mock Fusion mode, LLM off).
     """
-    load_dotenv()
+    environment_names = set(os.environ)
+    env_file = Path.cwd() / ".env"
+    if env_file.is_file():
+        load_dotenv(dotenv_path=env_file)
+    example_file = Path.cwd() / ".env.example"
+    if example_file.is_file():
+        for name, value in dotenv_values(example_file).items():
+            if (
+                name not in environment_names
+                and value
+                and not os.environ.get(name, "").strip()
+            ):
+                os.environ[name] = value
     return Config(
         fusion_mode=read_setting("FUSION_MODE", "mock").lower(),
         backlog_file_path=read_setting("BACKLOG_FILE_PATH"),

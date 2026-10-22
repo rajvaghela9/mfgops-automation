@@ -77,6 +77,7 @@ def test_blocked_proxy_gets_a_plain_explanation():
     blocked = SimpleNamespace(status_code=403)
     assert "VPN" in llm_client.describe_failure(blocked)
     assert "API key" in llm_client.describe_failure(SimpleNamespace(status_code=401))
+    assert "too large" in llm_client.describe_failure(SimpleNamespace(status_code=413))
     assert "network" in llm_client.describe_failure(
         openai.APIConnectionError(request=None)
     )

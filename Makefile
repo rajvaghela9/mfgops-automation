@@ -1,4 +1,5 @@
 APP_NAME    ?= $(notdir $(CURDIR))
+PYTHON      ?= python3
 # The scaffold ships helm/app, which gets renamed per service, so discover it
 # instead of hardcoding. Override from the environment if a repo ever carries
 # more than one chart.
@@ -35,7 +36,7 @@ run:
 
 # Streamlit UI. `python -m` keeps the repo root on sys.path so `src.*` imports work.
 ui:
-	python -m streamlit run src/ui_layer/app.py
+	$(PYTHON) -m streamlit run src/ui_layer/app.py
 
 helm-package:
 	helm package $(CHART_DIR) --version $(VERSION) --app-version $(VERSION)
