@@ -1,9 +1,10 @@
 """Stores orders while they are being worked on, plus the permanent all-orders record.
 
 Lifecycle: an order is inserted when first fetched and updated in place when OM corrects
-it in Fusion. Once released it leaves the active `orders` table, but every order ever seen
-keeps one row in `all_orders` (it feeds the Dashboard). Every reviewer decision is kept in
-`order_decisions`.
+it in Fusion. Once approved it waits (status APPROVED) until Fusion's USPO for it shows up
+in a backlog report; then it is released and leaves the active `orders` table. Every order
+ever seen keeps one row in `all_orders` (it feeds the Dashboard). Every reviewer decision
+is kept in `order_decisions`. Dummy (demo) orders are always listed after real ones.
 """
 
 import hashlib
@@ -13,6 +14,7 @@ from typing import Dict, List, Optional
 
 from src.knowledge_layer.db import get_connection
 from src.utils.models import (
+    DUMMY_ORDER_PREFIX,
     Order,
     OrderLine,
     OrderStatus,
@@ -22,8 +24,7 @@ from src.utils.models import (
 )
 from src.utils.time_helpers import utc_now_iso
 
-# Header fields that come from Fusion. A change in any of these (or in the lines)
-# means OM edited the order.
+# Header fields that come from Fusion (stored on every fetch).
 FUSION_HEADER_FIELDS = [
     "order_type",
     "booked_date",
@@ -56,10 +57,18 @@ LINE_FIELDS = [
     "serial_number",
     "work_order",
 ]
+# Fields Fusion itself changes while releasing an order (the USPO, the line status).
+# They are left out of the fingerprint, so a release is never mistaken for an OM edit.
+NOT_EDITED_BY_OM = {"arrow_po", "line_status"}
+# Sort dummy orders after real ones, then oldest first.
+DUMMY_LAST = (
+    f"CASE WHEN substr(order_no, 1, {len(DUMMY_ORDER_PREFIX)}) = '{DUMMY_ORDER_PREFIX}' "
+    "THEN 1 ELSE 0 END"
+)
 
 
 def compute_content_hash(order: Order) -> str:
-    """Fingerprint the Fusion-owned content of an order (header fields and lines).
+    """Fingerprint the parts of an order that OM edits (header fields and lines).
 
     Args:
         order: The order.
@@ -67,8 +76,19 @@ def compute_content_hash(order: Order) -> str:
     Returns:
         A SHA-256 hex digest that changes whenever OM edits the order.
     """
-    content = {name: getattr(order, name) for name in FUSION_HEADER_FIELDS}
-    content["lines"] = [asdict(line) for line in order.lines]
+    content = {
+        name: getattr(order, name)
+        for name in FUSION_HEADER_FIELDS
+        if name not in NOT_EDITED_BY_OM
+    }
+    content["lines"] = [
+        {
+            key: value
+            for key, value in asdict(line).items()
+            if key not in NOT_EDITED_BY_OM
+        }
+        for line in sorted(order.lines, key=lambda line: line.line_number)
+    ]
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
 
 
@@ -101,7 +121,7 @@ def copy_to_all_orders(connection, order_no: str, **release_details) -> None:
     Args:
         connection: Open SQLite connection.
         order_no: Fusion order number.
-        **release_details: Optional release_request_id and released_at.
+        **release_details: Optional release_request_id, released_at, uspo, released_by.
 
     Returns:
         None.
@@ -182,7 +202,8 @@ def upsert_order(order: Order) -> str:
         if released:
             return "already_released"
         existing = connection.execute(
-            "SELECT content_hash FROM orders WHERE order_no = ?", (order.order_no,)
+            "SELECT content_hash, status FROM orders WHERE order_no = ?",
+            (order.order_no,),
         ).fetchone()
 
         if existing is None:
@@ -205,11 +226,24 @@ def upsert_order(order: Order) -> str:
             return "unchanged"
 
         assignments = ", ".join(f"{name} = ?" for name in FUSION_HEADER_FIELDS)
+        if existing["status"] == OrderStatus.APPROVED.value:
+            # Already approved and released in Fusion: keep the decision, refresh the data.
+            connection.execute(
+                f"UPDATE orders SET {assignments}, content_hash = ?, raw_json = ?, "
+                "last_updated_at = ? WHERE order_no = ?",
+                (*header_values, new_hash, raw_json, now, order.order_no),
+            )
+            connection.execute(
+                "DELETE FROM order_lines WHERE order_no = ?", (order.order_no,)
+            )
+            insert_lines(connection, order)
+            return "unchanged"
+
         connection.execute(
             f"UPDATE orders SET {assignments}, status = ?, route = NULL, "
             "route_reason = NULL, ai_verdict = NULL, ai_used = NULL, ai_summary = NULL, "
             "ai_reasons_json = NULL, reviewer_decision = NULL, reviewer_comment = NULL, "
-            "decided_by = NULL, review_thread_id = NULL, "
+            "decided_by = NULL, review_thread_id = NULL, approved_at = NULL, "
             "rework_count = rework_count + 1, content_hash = ?, raw_json = ?, "
             "last_updated_at = ? WHERE order_no = ?",
             (
@@ -283,7 +317,7 @@ def get_active_orders(statuses: Optional[List[str]] = None) -> List[Order]:
         statuses: OrderStatus values to keep, or None for all active orders.
 
     Returns:
-        Orders (with lines), oldest first.
+        Orders (with lines): real orders oldest first, then dummy orders.
     """
     query, params = "SELECT order_no FROM orders", ()
     if statuses:
@@ -292,7 +326,9 @@ def get_active_orders(statuses: Optional[List[str]] = None) -> List[Order]:
     with get_connection() as connection:
         order_nos = [
             row["order_no"]
-            for row in connection.execute(query + " ORDER BY first_seen_at", params)
+            for row in connection.execute(
+                f"{query} ORDER BY {DUMMY_LAST}, first_seen_at", params
+            )
         ]
     return [order for order in map(get_order, order_nos) if order is not None]
 
@@ -414,12 +450,20 @@ def record_reviewer_decision(
     )
 
 
-def mark_released(order_no: str, release_request_id: str) -> None:
+def mark_released(
+    order_no: str,
+    release_request_id: str = "",
+    uspo: str = "",
+    released_by: str = "",
+) -> None:
     """Record the release in all_orders, then remove the order from the active tables.
 
     Args:
         order_no: Fusion order number.
-        release_request_id: Id returned by the release job submission.
+        release_request_id: Id of the release job submission (live Fusion only).
+        uspo: Fusion's USPO, as read from the backlog report ("" for dummy orders).
+        released_by: Who released it, e.g. "Fusion (outside this tool)"; "" means the
+            reviewer who approved it.
 
     Returns:
         None.
@@ -431,10 +475,89 @@ def mark_released(order_no: str, release_request_id: str) -> None:
             (OrderStatus.RELEASED.value, now, order_no),
         )
         copy_to_all_orders(
-            connection, order_no, release_request_id=release_request_id, released_at=now
+            connection,
+            order_no,
+            release_request_id=release_request_id,
+            released_at=now,
+            uspo=uspo,
+            released_by=released_by,
         )
         # Lines and findings go with it (ON DELETE CASCADE).
         connection.execute("DELETE FROM orders WHERE order_no = ?", (order_no,))
+
+
+def backfill_uspo(order_no: str, uspo: str) -> bool:
+    """Store the USPO on a released order that doesn't have it yet.
+
+    Args:
+        order_no: Fusion order number.
+        uspo: The USPO from the backlog report.
+
+    Returns:
+        True if the order is known in all_orders (whether or not it needed the USPO).
+    """
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT uspo FROM all_orders WHERE order_no = ?", (order_no,)
+        ).fetchone()
+        if row is None:
+            return False
+        if not row["uspo"]:
+            connection.execute(
+                "UPDATE all_orders SET uspo = ?, last_updated_at = ? WHERE order_no = ?",
+                (uspo, utc_now_iso(), order_no),
+            )
+    return True
+
+
+def mark_removed_from_backlog(order_no: str) -> None:
+    """Close an order that is no longer in the Fusion backlog (e.g. cancelled by OM).
+
+    Args:
+        order_no: Fusion order number.
+
+    Returns:
+        None.
+    """
+    with get_connection() as connection:
+        connection.execute(
+            "UPDATE orders SET status = ?, last_updated_at = ? WHERE order_no = ?",
+            (OrderStatus.REMOVED.value, utc_now_iso(), order_no),
+        )
+        copy_to_all_orders(connection, order_no)
+        connection.execute("DELETE FROM orders WHERE order_no = ?", (order_no,))
+
+
+def note_orders_missing_from_backlog(present_order_nos: List[str]) -> Dict[str, int]:
+    """Count, per active order, how many backlog reports in a row no longer listed it.
+
+    Orders missing from two reports in a row are closed as "no longer in the backlog",
+    except approved orders (the reviewer is told to check Fusion instead) and dummy
+    orders (they are never in Fusion).
+
+    Args:
+        present_order_nos: Every order number in the newest backlog report.
+
+    Returns:
+        {"removed": n, "missing": n} for this report.
+    """
+    present = set(present_order_nos)
+    counts = {"removed": 0, "missing": 0}
+    for order in get_active_orders():
+        if order.order_no.startswith(DUMMY_ORDER_PREFIX):
+            continue
+        if order.order_no in present:
+            if order.missing_snapshot_count:
+                update_order(order.order_no, missing_snapshot_count=0)
+            continue
+        missing_count = order.missing_snapshot_count + 1
+        if missing_count >= 2 and order.status != OrderStatus.APPROVED.value:
+            mark_removed_from_backlog(order.order_no)
+            counts["removed"] += 1
+        else:
+            update_order(order.order_no, missing_snapshot_count=missing_count)
+            counts["missing"] += 1
+    return counts
 
 
 def get_all_orders(search: str = "") -> List[Dict]:
@@ -444,13 +567,13 @@ def get_all_orders(search: str = "") -> List[Dict]:
         search: Optional text to match in the order number or country.
 
     Returns:
-        A list of dicts, one per order.
+        A list of dicts, one per order (dummy orders last).
     """
     pattern = f"%{search.strip()}%"
     with get_connection() as connection:
         rows = connection.execute(
             "SELECT * FROM all_orders WHERE order_no LIKE ? OR ship_to_country LIKE ? "
-            "ORDER BY last_updated_at DESC",
+            f"ORDER BY {DUMMY_LAST}, last_updated_at DESC",
             (pattern, pattern),
         ).fetchall()
     return [dict(row) for row in rows]
@@ -471,6 +594,7 @@ def get_dashboard_numbers(minutes_saved_per_order: float) -> Dict:
             "COALESCE(SUM(status = ?), 0) AS released, "
             "COALESCE(SUM(status = ?), 0) AS sent_to_om, "
             "COALESCE(SUM(status IN (?, ?)), 0) AS waiting, "
+            "COALESCE(SUM(status = ?), 0) AS approved_waiting, "
             "COALESCE(SUM(ai_verdict IS NOT NULL), 0) AS checked_by_ai, "
             "COUNT(agreed) AS compared, COALESCE(SUM(agreed), 0) AS agreed, "
             "COALESCE(SUM(rework_count = 0 AND status = ?), 0) AS first_time_right "
@@ -480,6 +604,7 @@ def get_dashboard_numbers(minutes_saved_per_order: float) -> Dict:
                 OrderStatus.SENT_TO_OM.value,
                 OrderStatus.WAITING_FOR_REVIEW.value,
                 OrderStatus.ON_HOLD.value,
+                OrderStatus.APPROVED.value,
                 OrderStatus.RELEASED.value,
             ),
         ).fetchone()
@@ -495,6 +620,7 @@ def get_dashboard_numbers(minutes_saved_per_order: float) -> Dict:
         "released": totals["released"],
         "sent_to_om": totals["sent_to_om"],
         "waiting": totals["waiting"],
+        "approved_waiting": totals["approved_waiting"],
         "agreement_rate": (
             totals["agreed"] / totals["compared"] if totals["compared"] else None
         ),

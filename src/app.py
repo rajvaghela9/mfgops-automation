@@ -1,7 +1,8 @@
-"""Service entrypoint: checks Fusion for orders and starts the review workflow for new ones.
+"""Service entrypoint: reads the Fusion backlog and starts the review workflow for new orders.
 
 Run with `python -m src.app`. It never releases or rejects an order by itself: each
 order's workflow pauses until a MfgOps user clicks a button in the UI (src/ui_layer/app.py).
+With FUSION_MODE=mail the backlog comes from the report Fusion mails every ~15 minutes.
 """
 
 import threading
@@ -12,8 +13,11 @@ from typing import Dict, Optional
 from src.integration_layer.fetch_orders_from_fusion import sync_orders
 from src.intelligence_layer.order_review_workflow import review_new_orders
 from src.knowledge_layer.db import init_db
-from src.knowledge_layer.reference_store import seed_reference_lists
-from src.knowledge_layer.rule_store import seed_default_rules
+from src.knowledge_layer.reference_store import (
+    seed_reference_lists,
+    upgrade_reference_lists,
+)
+from src.knowledge_layer.rule_store import seed_default_rules, upgrade_seed_rules
 from src.utils.config import load_config
 from src.utils.logging_config import get_logger
 
@@ -39,7 +43,8 @@ class HealthzHandler(BaseHTTPRequestHandler):
 
 
 def prepare_database() -> None:
-    """Create the tables and load seed rules and reference lists if they're empty.
+    """Create the tables, load seed rules and lists if they're empty, and add seed rules
+    and list entries that are newer than the database.
 
     Returns:
         None.
@@ -47,10 +52,12 @@ def prepare_database() -> None:
     init_db()
     seed_reference_lists()
     seed_default_rules()
+    upgrade_reference_lists()
+    upgrade_seed_rules()
 
 
 def run_pipeline_once() -> Dict[str, object]:
-    """Run one cycle: fetch orders from Fusion, then review the new and corrected ones.
+    """Run one cycle: read the Fusion backlog, then review the new and corrected orders.
 
     Returns:
         A summary: Fusion sync counts and the number of orders reviewed.

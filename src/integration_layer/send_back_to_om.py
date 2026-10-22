@@ -1,25 +1,81 @@
 """Emails the OM team about an order the reviewer sent back, with their comment and the details.
 
-The order stays active as SENT_TO_OM. When OM fixes it in Fusion, the next Fusion check
-sees the change and reviews it again from the start.
-EMAIL_MODE=mock writes the email to OUTBOX_DIR; live sending (MS Graph) is pending access.
+The order stays active as SENT_TO_OM. When OM fixes it in Fusion, the next backlog report
+shows the change and the order is reviewed again from the start.
+The subject carries "[Order <number>]" so OM's reply can be matched to the order later.
+Delivery (mock outbox or MS Graph, test redirect, no double sending) is in outbound_mail.
 """
 
-from pathlib import Path
+import html
 from typing import List, Tuple
 
+from src.integration_layer.outbound_mail import deliver_mail
+from src.knowledge_layer import mail_store
 from src.utils.config import load_config
-from src.utils.logging_config import get_logger
 from src.utils.models import ROUTE_LABELS, Order, RuleFinding
-from src.utils.time_helpers import utc_now_iso
 
-logger = get_logger(__name__)
+CELL = 'style="border:1px solid #ccc;padding:4px 8px;text-align:left"'
+
+
+def escape(value) -> str:
+    """Make a value safe to put in the HTML mail (order data is free text from Fusion).
+
+    Args:
+        value: Any value.
+
+    Returns:
+        Escaped text; "—" for empty values.
+    """
+    text = "" if value is None else str(value).strip()
+    return html.escape(text) if text else "—"
+
+
+def build_order_details_html(order: Order) -> str:
+    """Write the order header and lines as HTML (used in the OM and Arrow mails).
+
+    Args:
+        order: The order, with its lines.
+
+    Returns:
+        An HTML fragment.
+    """
+    details = [
+        ("Order type", f"{order.order_type} ({ROUTE_LABELS.get(order.route, '—')})"),
+        ("Booked", order.booked_date),
+        ("Bill to", f"{order.bill_to_customer}, {order.bill_to_address}"),
+        (
+            "Ship to",
+            f"{order.ship_to_customer}, {order.ship_to_address}, {order.ship_to_country}",
+        ),
+        ("Ship from", order.ship_from),
+        ("Incoterm (FOB)", order.fob),
+        ("Freight terms", order.freight_terms),
+        ("Shipping method", order.shipping_method),
+        ("Shipping instructions", order.shipping_instructions),
+    ]
+    header_rows = "".join(
+        f"<tr><th {CELL}>{escape(name)}</th><td {CELL}>{escape(value)}</td></tr>"
+        for name, value in details
+    )
+    line_rows = "".join(
+        f"<tr><td {CELL}>{escape(line.line_number)}</td><td {CELL}>{escape(line.sku)}</td>"
+        f"<td {CELL}>{escape(line.item_description)}</td>"
+        f"<td {CELL}>{escape(line.ordered_qty)}</td></tr>"
+        for line in sorted(order.lines, key=lambda line: line.line_number)
+    )
+    return (
+        f'<table style="border-collapse:collapse">{header_rows}</table>'
+        "<p><b>Order lines</b></p>"
+        f'<table style="border-collapse:collapse"><tr><th {CELL}>Line</th>'
+        f"<th {CELL}>Item</th><th {CELL}>Description</th><th {CELL}>Qty</th></tr>"
+        f"{line_rows}</table>"
+    )
 
 
 def build_om_email(
     order: Order, findings: List[RuleFinding], reviewer: str, comment: str
 ) -> Tuple[str, str]:
-    """Write the subject and body of the email to OM.
+    """Write the subject and HTML body of the email to OM.
 
     Args:
         order: The order sent back.
@@ -28,76 +84,33 @@ def build_om_email(
         comment: What OM should correct.
 
     Returns:
-        A (subject, body) tuple.
+        A (subject, html_body) tuple.
     """
-    subject = f"Order {order.order_no} needs correction before release to Arrow"
-    issues = [f"- {finding.rule_name}: {finding.message}" for finding in findings]
-    issues += [f"- {reason}" for reason in order.ai_reasons]
-    lines = "\n".join(
-        f"- Line {line.line_number}: {line.ordered_qty} x {line.sku} ({line.item_description})"
-        for line in order.lines
+    subject = f"[Order {order.order_no}] needs correction before release to Arrow"
+    issues = [f"{finding.rule_name}: {finding.message}" for finding in findings]
+    issues += list(order.ai_reasons)
+    issue_items = "".join(f"<li>{escape(issue)}</li>" for issue in issues) or (
+        "<li>None besides the comment above.</li>"
     )
     body = (
-        f"Hello OM team,\n\n"
-        f"Order {order.order_no} was not released to Arrow.\n\n"
-        f"Correction needed (from {reviewer}, MfgOps):\n{comment}\n\n"
-        f"Issues found during review:\n{chr(10).join(issues) or '- None besides the above'}\n\n"
-        f"Order details:\n"
-        f"- Order type: {order.order_type} ({ROUTE_LABELS.get(order.route, order.route)})\n"
-        f"- Ship to: {order.ship_to_customer}, {order.ship_to_address}, "
-        f"{order.ship_to_country}\n"
-        f"- Customer PO: {order.customer_po or 'missing'}\n"
-        f"- Shipping method: {order.shipping_method or 'missing'}\n"
-        f"{lines}\n\n"
-        f"Please correct the order in Fusion. It will be checked again automatically.\n\n"
-        f"MfgOps Order Review"
+        "<p>Hello OM team,</p>"
+        f"<p>Order <b>{escape(order.order_no)}</b> was not released to Arrow.</p>"
+        f"<p><b>Correction needed</b> (from {escape(reviewer)}, MfgOps):<br>"
+        f"{escape(comment).replace(chr(10), '<br>')}</p>"
+        f"<p><b>Issues found during review</b></p><ul>{issue_items}</ul>"
+        "<p><b>Order details</b></p>"
+        f"{build_order_details_html(order)}"
+        "<p>Please correct the order in Fusion. It will be checked again automatically "
+        "once the corrected order shows up in the backlog report.</p>"
+        "<p>MfgOps Order Review</p>"
     )
     return subject, body
-
-
-def send_mock(to_address: str, subject: str, body: str) -> str:
-    """Save the email as a text file instead of sending it.
-
-    Args:
-        to_address: Recipient (written into the file).
-        subject: Email subject.
-        body: Email body.
-
-    Returns:
-        Path of the written file.
-    """
-    outbox = Path(load_config().outbox_dir)
-    outbox.mkdir(parents=True, exist_ok=True)
-    stamp = utc_now_iso().replace(":", "").replace("+0000", "Z")
-    path = outbox / f"{stamp}_{subject.split()[1]}.txt"
-    path.write_text(
-        f"To: {to_address}\nSubject: {subject}\n\n{body}\n", encoding="utf-8"
-    )
-    logger.info("[mock] OM email written to %s", path)
-    return str(path)
-
-
-def send_live(to_address: str, subject: str, body: str) -> str:
-    """Send the email through MS Graph from the monitored MfgOps mailbox.
-
-    Args:
-        to_address: Recipient.
-        subject: Email subject.
-        body: Email body.
-
-    Returns:
-        The sent message's id.
-    """
-    raise NotImplementedError(
-        "Live email is pending the MS Graph app registration (Mail.Send) and the "
-        "mailbox to send from; consider sharing one Graph sender module with the EUS flow."
-    )
 
 
 def email_om_team(
     order: Order, findings: List[RuleFinding], reviewer: str, comment: str
 ) -> str:
-    """Email OM the reviewer's correction plus the order details.
+    """Email OM the reviewer's correction plus the order details (once per correction).
 
     Args:
         order: The order sent back.
@@ -106,11 +119,15 @@ def email_om_team(
         comment: What OM should correct.
 
     Returns:
-        Where the email went (file path in mock mode, message id when live).
+        Where the email went (outbox file in mock mode, Graph message id when live).
+        Raises outbound_mail.MailNotSentError if it could not be sent.
     """
-    config = load_config()
-    to_address = config.om_team_email or "<OM_TEAM_EMAIL not set>"
     subject, body = build_om_email(order, findings, reviewer, comment)
-    if config.email_mode == "live":
-        return send_live(to_address, subject, body)
-    return send_mock(to_address, subject, body)
+    return deliver_mail(
+        mail_store.OM_CORRECTION,
+        order.order_no,
+        load_config().om_team_email or "",
+        subject,
+        body,
+        idempotency_key=f"om_correction:{order.order_no}:{order.rework_count}",
+    )

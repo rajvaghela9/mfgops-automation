@@ -5,6 +5,7 @@ Tabs: Dashboard, Orders to Review, Order Tracker, Rules Assistant, EUS Approval.
 """
 
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -16,6 +17,7 @@ from src.intelligence_layer.order_review_workflow import submit_reviewer_decisio
 from src.intelligence_layer.rule_checks import find_release_blocker
 from src.knowledge_layer import (
     learning_request_store,
+    mail_store,
     order_store,
     reference_store,
     rule_store,
@@ -30,6 +32,7 @@ from src.utils.models import (
     ReviewerDecision,
     RuleOutcome,
     RuleType,
+    is_dummy_order,
 )
 
 VERDICT_LABELS = {
@@ -47,8 +50,12 @@ STATUS_LABELS = {
     OrderStatus.WAITING_FOR_REVIEW.value: "Waiting for your review",
     OrderStatus.ON_HOLD.value: "On hold",
     OrderStatus.SENT_TO_OM.value: "Sent to OM — waiting for correction",
+    OrderStatus.APPROVED.value: "Approved — waiting for the USPO from Fusion",
     OrderStatus.RELEASED.value: "Released to Arrow",
+    OrderStatus.REMOVED.value: "No longer in the Fusion backlog",
 }
+# A backlog report is expected about every 15 minutes; warn after three missed ones.
+REPORT_LATE_MINUTES = 45
 FINDING_STYLES = {
     RuleOutcome.REJECT.value: (st.error, "⛔"),
     RuleOutcome.HOLD.value: (st.warning, "⏸️"),
@@ -69,6 +76,41 @@ def label(labels: dict, value: Optional[str]) -> str:
     return labels.get(value, value) if value else "—"
 
 
+def minutes_since(timestamp: Optional[str]) -> Optional[float]:
+    """Work out how long ago an ISO-8601 time was.
+
+    Args:
+        timestamp: e.g. "2026-10-19T11:33:17Z" or "2026-10-19T11:33:17+0000".
+
+    Returns:
+        Minutes since then, or None if the time is empty or unreadable.
+    """
+    if not timestamp:
+        return None
+    text = timestamp.replace("Z", "+00:00")
+    if text.endswith("+0000"):
+        text = text[:-5] + "+00:00"
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - moment).total_seconds() / 60
+
+
+def show_order_number(order_no: str) -> str:
+    """Show an order number, marking dummy (demo) orders.
+
+    Args:
+        order_no: Order number.
+
+    Returns:
+        The number, with "🧪 " in front of dummy orders.
+    """
+    return f"🧪 {order_no}" if is_dummy_order(order_no) else order_no
+
+
 def show_flash_messages() -> None:
     """Show the outcome of the last button press (saved before the page redrew).
 
@@ -81,8 +123,66 @@ def show_flash_messages() -> None:
         st.error(st.session_state.pop("flash_error"))
 
 
+def describe_sync(sync: dict, reviewed: int) -> str:
+    """Summarize one check for new orders in plain words.
+
+    Args:
+        sync: Counts from sync_orders.
+        reviewed: How many orders the review workflow checked.
+
+    Returns:
+        A short sentence.
+    """
+    if not sync.get("new_report", 1):
+        return "No new backlog report mail since the last check."
+    parts = [
+        f"{sync['new']} new and {sync['updated']} corrected order(s) found, "
+        f"{reviewed} reviewed."
+    ]
+    if sync.get("release_confirmed"):
+        parts.append(
+            f"{sync['release_confirmed']} release(s) confirmed by Fusion's USPO."
+        )
+    if sync.get("released_outside_tool"):
+        parts.append(
+            f"{sync['released_outside_tool']} order(s) were released in Fusion "
+            "without a decision here."
+        )
+    if sync.get("removed_from_backlog"):
+        parts.append(
+            f"{sync['removed_from_backlog']} order(s) left the Fusion backlog and "
+            "were closed."
+        )
+    return " ".join(parts)
+
+
+def render_mail_sync_status() -> None:
+    """Show when the last Fusion backlog report mail arrived and whether it was read.
+
+    Returns:
+        None.
+    """
+    status = mail_store.get_mail_sync_status()
+    last = status["last_processed"]
+    if last is None:
+        st.sidebar.caption("No backlog report mail read yet.")
+    else:
+        age = minutes_since(last["received_at"]) or 0
+        st.sidebar.caption(
+            f"Last backlog report: {last['received_at'].replace('T', ' ')[:16]} UTC "
+            f"({age:.0f} min ago), {last['order_count']} orders"
+        )
+        if age > REPORT_LATE_MINUTES:
+            st.sidebar.warning(
+                f"⚠️ No new backlog report for {age:.0f} minutes (Fusion sends one about "
+                "every 15). Check the mailbox."
+            )
+    if status["last_error"]:
+        st.sidebar.error(f"The newest report couldn't be read: {status['last_error']}")
+
+
 def render_sidebar() -> str:
-    """Show who is reviewing and the button that checks Fusion for new orders.
+    """Show who is reviewing and the button that checks for new orders.
 
     Returns:
         The reviewer's name ("" until entered).
@@ -93,26 +193,36 @@ def render_sidebar() -> str:
         "Your name (saved with every decision)", key="reviewer"
     )
     st.sidebar.header("📥 New orders")
-    if st.sidebar.button("Check Fusion for new orders", width="stretch"):
-        with st.spinner("Fetching orders and reviewing them..."):
+    if st.sidebar.button("Check for new orders", width="stretch"):
+        with st.spinner("Reading the backlog and reviewing new orders..."):
             try:
                 summary = run_pipeline_once()
-                sync = summary["sync"]
-                st.sidebar.success(
-                    f"{sync['new']} new and {sync['updated']} corrected order(s) found, "
-                    f"{summary['reviewed']} reviewed."
-                )
+                st.sidebar.success(describe_sync(summary["sync"], summary["reviewed"]))
             except Exception as error:
                 st.sidebar.error(f"Something went wrong: {error}")
-    if config.fusion_mode == "file":
-        source = f"backlog report “{Path(config.backlog_file_path or '').name}”"
-        if config.include_demo_orders:
-            source += " + 10 demo problem orders"
-    else:
+    dummies = " + 5 dummy orders (🧪)" if config.include_demo_orders else ""
+    if config.fusion_mode == "mail":
+        source = f"Fusion backlog report mails to {config.graph_api_mailbox}{dummies}"
+    elif config.fusion_mode == "file":
         source = (
-            "sample orders (test mode)" if config.fusion_mode == "mock" else "Fusion"
+            f"backlog report “{Path(config.backlog_file_path or '').name}”{dummies}"
         )
+    elif config.fusion_mode == "mock":
+        source = "5 dummy orders only (test mode)"
+    else:
+        source = "Fusion"
     st.sidebar.caption(f"Orders come from: {source}")
+    if config.fusion_mode == "mail":
+        render_mail_sync_status()
+    mail_target = config.email_redirect_to or config.om_team_email or "not set"
+    st.sidebar.caption(
+        "Emails: "
+        + (
+            f"sent from {config.sender_mailbox} to {mail_target}"
+            if config.email_mode == "live"
+            else "saved to the outbox folder (test mode)"
+        )
+    )
     st.sidebar.caption(
         "AI review: " + ("on" if config.llm_enabled else "off — only fixed checks run")
     )
@@ -132,11 +242,12 @@ def render_dashboard_tab() -> None:
         """Format a 0-1 rate as a percentage. Returns: e.g. "85%" or "—"."""
         return "—" if value is None else f"{value:.0%}"
 
-    columns = st.columns(4)
+    columns = st.columns(5)
     columns[0].metric("Orders received", numbers["orders_seen"])
     columns[1].metric("Released to Arrow", numbers["released"])
-    columns[2].metric("Sent back to OM", numbers["sent_to_om"])
-    columns[3].metric("Waiting or on hold", numbers["waiting"])
+    columns[2].metric("Approved, waiting for USPO", numbers["approved_waiting"])
+    columns[3].metric("Sent back to OM", numbers["sent_to_om"])
+    columns[4].metric("Waiting or on hold", numbers["waiting"])
     columns = st.columns(3)
     columns[0].metric("AI and reviewer agreed", as_percent(numbers["agreement_rate"]))
     columns[1].metric(
@@ -156,7 +267,7 @@ def render_dashboard_tab() -> None:
                 horizontal=True,
             )
         else:
-            st.info("No orders yet. Use “Check Fusion for new orders” in the sidebar.")
+            st.info("No orders yet. Use “Check for new orders” in the sidebar.")
     with right:
         st.subheader("Where orders are now")
         if numbers["by_status"]:
@@ -184,8 +295,14 @@ def handle_decision(order_no: str, decision: str, reviewer: str) -> None:
     except ValueError as error:
         st.session_state["flash_error"] = f"{order_no}: {error}"
         return
+    approved = (
+        f"{order_no} (dummy order) was approved and closed."
+        if is_dummy_order(order_no)
+        else f"{order_no} is approved. It stays listed as “Approved — waiting for the "
+        "USPO” until Fusion's USPO for it shows up in a backlog report mail."
+    )
     message = {
-        ReviewerDecision.APPROVE.value: f"{order_no} was released to Arrow.",
+        ReviewerDecision.APPROVE.value: approved,
         ReviewerDecision.SEND_TO_OM.value: f"{order_no} was sent back to OM by email.",
         ReviewerDecision.HOLD.value: f"{order_no} is on hold.",
     }[decision]
@@ -254,21 +371,35 @@ def render_decision_buttons(
             placeholder="e.g. EUS already sent to Arrow by email / Please add 2 UK power cords",
         )
         approve, send, hold = st.columns(3)
+        approve_help = (
+            "Dummy order: approving closes it straight away."
+            if is_dummy_order(order.order_no)
+            else "Release the order in Fusion first (Priority Release), then click "
+            "Approve. It stays listed until Fusion's USPO shows up in a backlog report."
+        )
         buttons = [
             (
                 approve,
-                "✅ Approve & release",
+                "✅ Approve (released in Fusion)",
                 ReviewerDecision.APPROVE.value,
                 bool(blocker),
+                approve_help,
             ),
-            (send, "📧 Send to OM", ReviewerDecision.SEND_TO_OM.value, False),
-            (hold, "⏸️ Put on hold", ReviewerDecision.HOLD.value, False),
+            (
+                send,
+                "📧 Send to OM",
+                ReviewerDecision.SEND_TO_OM.value,
+                False,
+                "Emails OM your comment and the order details.",
+            ),
+            (hold, "⏸️ Put on hold", ReviewerDecision.HOLD.value, False, None),
         ]
-        for column, text, decision, blocked in buttons:
+        for column, text, decision, blocked, help_text in buttons:
             column.form_submit_button(
                 text,
                 disabled=not reviewer or blocked,
                 width="stretch",
+                help=help_text,
                 on_click=handle_decision,
                 args=(order.order_no, decision, reviewer),
             )
@@ -290,7 +421,8 @@ def render_order_card(order: Order, reviewer: str) -> None:
     blocker = find_release_blocker(findings)
     title = " · ".join(
         [
-            f"{VERDICT_LABELS.get(order.ai_verdict, '').split()[0]} {order.order_no}",
+            f"{VERDICT_LABELS.get(order.ai_verdict, '').split()[0]} "
+            + show_order_number(order.order_no),
             label(ROUTE_LABELS, order.route),
             order.ship_to_country,
             order.order_type,
@@ -303,10 +435,10 @@ def render_order_card(order: Order, reviewer: str) -> None:
             st.write(order.ai_summary)
         for reason in order.ai_reasons:
             st.markdown(f"- {reason}")
-        if order.arrow_po:
+        if is_dummy_order(order.order_no):
             st.caption(
-                f"ℹ️ This order already has Arrow PO {order.arrow_po}, so it was sent to Arrow "
-                "before. Orders in the backlog report you loaded are treated as test data."
+                "🧪 Dummy order, made up to show the AI rejecting or holding an order. "
+                "It is not in Fusion."
             )
         if blocker:
             st.error(f"🔒 This order can never be released: {blocker}")
@@ -331,15 +463,16 @@ def render_review_tab(reviewer: str) -> None:
     """
     show_flash_messages()
     orders = order_store.get_active_orders(REVIEWABLE_STATUSES)
+    render_waiting_for_uspo()
     if not orders:
-        st.info("Nothing to review. Use “Check Fusion for new orders” in the sidebar.")
+        st.info("Nothing to review. Use “Check for new orders” in the sidebar.")
         return
     without_ai = [order.order_no for order in orders if not order.ai_used]
     if without_ai:
         st.warning(
             f"⚠️ {len(without_ai)} order(s) were checked by the fixed rules only, because "
             "the AI could not be reached (see each order's summary for the reason). "
-            "Once the connection works, click “Check Fusion for new orders” to review "
+            "Once the connection works, click “Check for new orders” to review "
             "them again with the AI."
         )
     categories = st.multiselect(
@@ -356,6 +489,53 @@ def render_review_tab(reviewer: str) -> None:
             render_order_card(order, reviewer)
 
 
+def render_waiting_for_uspo() -> None:
+    """List approved orders still waiting for Fusion's USPO (no buttons: Fusion decides).
+
+    Returns:
+        None.
+    """
+    approved = order_store.get_active_orders([OrderStatus.APPROVED.value])
+    if not approved:
+        return
+    warning_minutes = load_config().uspo_wait_warning_minutes
+    late = [
+        order.order_no
+        for order in approved
+        if (minutes_since(order.approved_at) or 0) > warning_minutes
+    ]
+    with st.expander(
+        f"⏳ Approved — waiting for the USPO from Fusion ({len(approved)})",
+        expanded=bool(late),
+    ):
+        st.caption(
+            "These orders were approved and released in Fusion. Each one leaves this list "
+            "once its USPO shows up in a Fusion backlog report mail."
+        )
+        if late:
+            st.warning(
+                f"No USPO after {warning_minutes} minutes for: {', '.join(late)}. "
+                "Check the release in Fusion."
+            )
+        st.dataframe(
+            [
+                {
+                    "Order": order.order_no,
+                    "Category": label(ROUTE_LABELS, order.route),
+                    "Country": order.ship_to_country,
+                    "Approved by": order.decided_by or "—",
+                    "Approved (UTC)": (order.approved_at or "")[:16].replace("T", " "),
+                    "Not in the last report": (
+                        "⚠️ check Fusion" if order.missing_snapshot_count else ""
+                    ),
+                }
+                for order in approved
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+
+
 def render_tracker_tab() -> None:
     """Show where every active order is, and the full record of all orders.
 
@@ -368,7 +548,7 @@ def render_tracker_tab() -> None:
         st.dataframe(
             [
                 {
-                    "Order": order.order_no,
+                    "Order": show_order_number(order.order_no),
                     "Category": label(ROUTE_LABELS, order.route),
                     "Country": order.ship_to_country,
                     "Status": label(STATUS_LABELS, order.status),
@@ -390,7 +570,7 @@ def render_tracker_tab() -> None:
         st.dataframe(
             [
                 {
-                    "Order": row["order_no"],
+                    "Order": show_order_number(row["order_no"]),
                     "Category": label(ROUTE_LABELS, row["route"]),
                     "Country": row["ship_to_country"],
                     "Status": label(STATUS_LABELS, row["status"]),
@@ -401,6 +581,7 @@ def render_tracker_tab() -> None:
                     "Reviewed by": row["decided_by"] or "—",
                     "Comment": row["reviewer_comment"] or "",
                     "Released on": (row["released_at"] or "")[:10],
+                    "USPO": row["uspo"] or "",
                 }
                 for row in rows
             ],
@@ -409,6 +590,44 @@ def render_tracker_tab() -> None:
         )
     else:
         st.info("No orders match.")
+    render_sent_emails()
+
+
+def render_sent_emails() -> None:
+    """Show the emails the service sent most recently (to OM and Arrow).
+
+    Returns:
+        None.
+    """
+    sent = mail_store.get_recent_outbound()
+    if not sent:
+        return
+    labels = {
+        mail_store.OM_CORRECTION: "To OM",
+        mail_store.ARROW_NOTICE: "To Arrow",
+    }
+    states = {
+        mail_store.SENT: "✅ Sent",
+        mail_store.MOCK: "📁 Saved to outbox (test mode)",
+        mail_store.FAILED: "❌ Failed",
+    }
+    with st.expander(f"📧 Emails sent ({len(sent)} most recent)"):
+        st.dataframe(
+            [
+                {
+                    "When (UTC)": (row["processed_at"] or "")[:16].replace("T", " "),
+                    "Order": row["order_no"],
+                    "Type": labels.get(row["kind"], row["kind"]),
+                    "To": row["recipient"],
+                    "Subject": row["subject"],
+                    "Result": states.get(row["status"], row["status"]),
+                    "Error": row["error"] or "",
+                }
+                for row in sent
+            ],
+            hide_index=True,
+            width="stretch",
+        )
 
 
 def handle_start_learning_chat(request_id: int, reviewer: str) -> None:

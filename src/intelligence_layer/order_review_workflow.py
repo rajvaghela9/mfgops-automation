@@ -2,11 +2,15 @@
 
     decide category -> run fixed checks -> AI verdict -> send to review queue
         -> [PAUSE: wait for the reviewer]
-        -> release to Arrow | email OM | keep on hold (-> wait again)
-        -> learn from disagreement -> done
+        -> approve (released in Fusion by hand) | email OM | keep on hold (-> wait again)
+        -> learn from disagreement
+        -> (approved) [PAUSE: wait for Fusion's USPO] -> finish release (+ Arrow mail)
+        -> done
 
-While waiting for the reviewer nothing runs: the graph is saved to WORKFLOW_DB_PATH and
-the process can stop. A button click in the UI resumes it (submit_reviewer_decision).
+While paused nothing runs: the graph is saved to WORKFLOW_DB_PATH and the process can
+stop. A button click in the UI resumes it (submit_reviewer_decision); the USPO showing up
+in a backlog report mail resumes an approved order (confirm_release_from_report). Dummy
+orders never exist in Fusion, so they are released straight after approval.
 Only the "AI verdict" step uses the AI; every other step is plain code.
 """
 
@@ -20,8 +24,14 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
-from src.integration_layer.push_orders_to_b2b import release_order_to_arrow
+from src.integration_layer.outbound_mail import MailNotSentError
+from src.integration_layer.push_orders_to_b2b import (
+    ESS_RELEASE,
+    release_order_to_arrow,
+    release_strategy,
+)
 from src.integration_layer.send_back_to_om import email_om_team
+from src.integration_layer.send_order_mail_to_arrow import email_arrow, needs_arrow_mail
 from src.intelligence_layer.ai_order_judge import describe_order, judge_order
 from src.intelligence_layer.llm_client import is_ai_configured
 from src.intelligence_layer.order_router import decide_route
@@ -44,7 +54,9 @@ from src.utils.models import (
     ReviewerDecision,
     RuleFinding,
     Verdict,
+    is_dummy_order,
 )
+from src.utils.time_helpers import utc_now_iso
 
 logger = get_logger(__name__)
 
@@ -64,6 +76,8 @@ class OrderReviewState(TypedDict, total=False):
     reviewer_decision: str
     reviewer_comment: str
     reviewer: str
+    release_request_id: str
+    uspo: str
 
 
 def decide_order_category(state: OrderReviewState) -> Dict:
@@ -182,14 +196,58 @@ def choose_next_step(state: OrderReviewState) -> str:
         The name of the next step.
     """
     return {
-        ReviewerDecision.APPROVE.value: "release_to_arrow",
+        ReviewerDecision.APPROVE.value: "approve_and_wait_for_uspo",
         ReviewerDecision.SEND_TO_OM.value: "send_back_to_om_team",
         ReviewerDecision.HOLD.value: "keep_on_hold",
     }[state["reviewer_decision"]]
 
 
-def release_to_arrow(state: OrderReviewState) -> Dict:
-    """Release the order to Arrow, then move it from active orders to all orders.
+def approve_and_wait_for_uspo(state: OrderReviewState) -> Dict:
+    """Record the approval. The reviewer has released the order in Fusion by hand (or, in
+    FUSION_MODE=live, the release job is submitted here); it stays listed as "Approved"
+    until Fusion's USPO for it appears in a backlog report.
+
+    Args:
+        state: The workflow state.
+
+    Returns:
+        The release job id ("" unless the release was submitted to Fusion).
+    """
+    order_no = state["order_no"]
+    order_store.record_reviewer_decision(
+        order_no,
+        state["reviewer_decision"],
+        state["reviewer"],
+        state["reviewer_comment"],
+    )
+    request_id = ""
+    if release_strategy() == ESS_RELEASE and not is_dummy_order(order_no):
+        request_id = release_order_to_arrow(order_no)
+    order_store.update_order(
+        order_no, status=OrderStatus.APPROVED.value, approved_at=utc_now_iso()
+    )
+    return {"release_request_id": request_id}
+
+
+def wait_for_uspo(state: OrderReviewState) -> Dict:
+    """Pause until Fusion's USPO for the order shows up in a backlog report mail.
+
+    Args:
+        state: The workflow state.
+
+    Returns:
+        The USPO.
+    """
+    answer = interrupt({"order_no": state["order_no"], "waiting_for": "uspo"})
+    return {"uspo": answer["uspo"]}
+
+
+def finish_release(state: OrderReviewState) -> Dict:
+    """Mail Arrow the special instructions (if the order has any), then move the order
+    from active orders to all orders.
+
+    A failed Arrow mail is logged (and shown in the UI) but doesn't stop the release:
+    the order is already with Arrow through B2B.
 
     Args:
         state: The workflow state.
@@ -198,14 +256,19 @@ def release_to_arrow(state: OrderReviewState) -> Dict:
         No state changes.
     """
     order_no = state["order_no"]
-    request_id = release_order_to_arrow(order_no)
-    order_store.record_reviewer_decision(
+    uspo = state.get("uspo", "")
+    order = order_store.get_order(order_no)
+    if order is not None and uspo and needs_arrow_mail(order):
+        try:
+            email_arrow(order, uspo)
+        except MailNotSentError as error:
+            logger.warning("Arrow mail for %s not sent: %s", order_no, error)
+    order_store.mark_released(
         order_no,
-        state["reviewer_decision"],
-        state["reviewer"],
-        state["reviewer_comment"],
+        release_request_id=state.get("release_request_id", ""),
+        uspo=uspo,
+        released_by=state["reviewer"],
     )
-    order_store.mark_released(order_no, request_id)
     return {}
 
 
@@ -282,6 +345,20 @@ def learn_from_disagreement(state: OrderReviewState) -> Dict:
     return {}
 
 
+def choose_step_after_learning(state: OrderReviewState) -> str:
+    """After an approval, wait for the USPO (dummy orders are released straight away).
+
+    Args:
+        state: The workflow state.
+
+    Returns:
+        The name of the next step, or END.
+    """
+    if state["reviewer_decision"] != ReviewerDecision.APPROVE.value:
+        return END
+    return "finish_release" if is_dummy_order(state["order_no"]) else "wait_for_uspo"
+
+
 def build_workflow() -> StateGraph:
     """Wire the steps together.
 
@@ -295,10 +372,12 @@ def build_workflow() -> StateGraph:
         ask_ai_for_verdict,
         send_to_review_queue,
         wait_for_reviewer,
-        release_to_arrow,
+        approve_and_wait_for_uspo,
         send_back_to_om_team,
         keep_on_hold,
         learn_from_disagreement,
+        wait_for_uspo,
+        finish_release,
     ]
     for step in steps:
         workflow.add_node(step.__name__, step)
@@ -310,12 +389,18 @@ def build_workflow() -> StateGraph:
     workflow.add_conditional_edges(
         "wait_for_reviewer",
         choose_next_step,
-        ["release_to_arrow", "send_back_to_om_team", "keep_on_hold"],
+        ["approve_and_wait_for_uspo", "send_back_to_om_team", "keep_on_hold"],
     )
     workflow.add_edge("keep_on_hold", "wait_for_reviewer")
-    workflow.add_edge("release_to_arrow", "learn_from_disagreement")
+    workflow.add_edge("approve_and_wait_for_uspo", "learn_from_disagreement")
     workflow.add_edge("send_back_to_om_team", "learn_from_disagreement")
-    workflow.add_edge("learn_from_disagreement", END)
+    workflow.add_conditional_edges(
+        "learn_from_disagreement",
+        choose_step_after_learning,
+        ["wait_for_uspo", "finish_release", END],
+    )
+    workflow.add_edge("wait_for_uspo", "finish_release")
+    workflow.add_edge("finish_release", END)
     return workflow
 
 
@@ -463,6 +548,16 @@ def submit_reviewer_decision(
     config = thread_config(order.review_thread_id)
     if "wait_for_reviewer" not in get_workflow().get_state(config).next:
         raise ValueError("This order isn't waiting for a decision any more.")
+    if decision == ReviewerDecision.SEND_TO_OM.value:
+        # Send the email before moving the workflow on, so a failed email changes
+        # nothing and the reviewer can simply try again. The workflow step then sees
+        # it was sent (same idempotency key) and doesn't send it twice.
+        try:
+            email_om_team(
+                order, order_store.get_rule_findings(order_no), reviewer, comment
+            )
+        except MailNotSentError as error:
+            raise ValueError(f"{error} Nothing was changed; please try again.")
     get_workflow().invoke(
         Command(
             resume={
@@ -473,3 +568,31 @@ def submit_reviewer_decision(
         ),
         config,
     )
+
+
+def confirm_release_from_report(order_no: str, uspo: str) -> bool:
+    """Finish an approved order's release now that Fusion's USPO showed up in a report.
+
+    Args:
+        order_no: Fusion order number.
+        uspo: The USPO from the backlog report.
+
+    Returns:
+        True if the order was approved and is now released; False if it wasn't waiting.
+    """
+    order = order_store.get_order(order_no)
+    if order is None or order.status != OrderStatus.APPROVED.value:
+        return False
+    config = thread_config(order.review_thread_id or "")
+    if (
+        order.review_thread_id
+        and "wait_for_uspo" in get_workflow().get_state(config).next
+    ):
+        get_workflow().invoke(Command(resume={"uspo": uspo}), config)
+    else:
+        # The saved workflow is gone (e.g. checkpoints were cleared): close it directly.
+        order_store.mark_released(
+            order_no, uspo=uspo, released_by=order.decided_by or ""
+        )
+    logger.info("%s released in Fusion (USPO %s)", order_no, uspo)
+    return True

@@ -3,9 +3,10 @@
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Optional
 
 from src.utils.config import load_config
+from src.utils.time_helpers import utc_now_iso
 
 SCHEMA = """
 -- Orders still being worked on. Released orders leave this table.
@@ -24,6 +25,8 @@ CREATE TABLE IF NOT EXISTS orders (
     reviewer_decision TEXT, reviewer_comment TEXT, decided_by TEXT,
     review_thread_id TEXT,
     rework_count INTEGER NOT NULL DEFAULT 0,
+    approved_at TEXT,
+    missing_snapshot_count INTEGER NOT NULL DEFAULT 0,
     content_hash TEXT, raw_json TEXT,
     first_seen_at TEXT, last_updated_at TEXT
 );
@@ -59,7 +62,31 @@ CREATE TABLE IF NOT EXISTS all_orders (
     ai_verdict TEXT, reviewer_decision TEXT, agreed INTEGER,
     decided_by TEXT, reviewer_comment TEXT, rework_count INTEGER,
     release_request_id TEXT, released_at TEXT,
+    uspo TEXT,                            -- Fusion's USPO, read from a backlog report mail
+    released_by TEXT,                     -- who released it ("Fusion (outside this tool)")
     first_seen_at TEXT, last_updated_at TEXT
+);
+
+-- Every mail the service read or sent (metadata only, never the body).
+CREATE TABLE IF NOT EXISTS mail_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    graph_message_id TEXT UNIQUE,
+    internet_message_id TEXT, conversation_id TEXT,
+    direction TEXT NOT NULL,              -- in | out
+    kind TEXT NOT NULL,                   -- backlog_report | om_correction | arrow_notice
+    order_no TEXT,
+    sender TEXT, recipient TEXT, subject TEXT,
+    received_at TEXT,
+    status TEXT NOT NULL,                 -- processed | superseded | failed | sent | mock
+    attachment_path TEXT, attachment_sha256 TEXT, order_count INTEGER,
+    idempotency_key TEXT,
+    error TEXT, processed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS mail_messages_key ON mail_messages (idempotency_key);
+
+-- Small key/value settings the service keeps for itself (e.g. seed versions).
+CREATE TABLE IF NOT EXISTS app_settings (
+    setting_name TEXT PRIMARY KEY, setting_value TEXT, updated_at TEXT
 );
 
 -- Business rules. One wide table for hard (fixed) and soft (AI-judged) rules;
@@ -132,7 +159,13 @@ def get_connection() -> Iterator[sqlite3.Connection]:
 
 # Columns added after the first release: (table, column, type). Existing databases get them
 # added on start, because CREATE TABLE IF NOT EXISTS leaves old tables unchanged.
-ADDED_COLUMNS = [("orders", "ai_used", "INTEGER")]
+ADDED_COLUMNS = [
+    ("orders", "ai_used", "INTEGER"),
+    ("orders", "approved_at", "TEXT"),
+    ("orders", "missing_snapshot_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("all_orders", "uspo", "TEXT"),
+    ("all_orders", "released_by", "TEXT"),
+]
 
 
 def add_missing_columns(connection: sqlite3.Connection) -> None:
@@ -167,3 +200,37 @@ def init_db() -> None:
     with get_connection() as connection:
         connection.executescript(SCHEMA)
         add_missing_columns(connection)
+
+
+def get_app_setting(name: str) -> Optional[str]:
+    """Read one of the service's own settings.
+
+    Args:
+        name: Setting name.
+
+    Returns:
+        The stored value, or None if it was never set.
+    """
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT setting_value FROM app_settings WHERE setting_name = ?", (name,)
+        ).fetchone()
+    return row["setting_value"] if row else None
+
+
+def set_app_setting(name: str, value: str) -> None:
+    """Store one of the service's own settings.
+
+    Args:
+        name: Setting name.
+        value: Value to store.
+
+    Returns:
+        None.
+    """
+    with get_connection() as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO app_settings (setting_name, setting_value, updated_at) "
+            "VALUES (?, ?, ?)",
+            (name, value, utc_now_iso()),
+        )

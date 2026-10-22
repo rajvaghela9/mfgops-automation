@@ -18,7 +18,7 @@ def open_ui(reviewer=""):
     return app
 
 
-def test_ui_shows_every_tab_without_errors(seeded_db):
+def test_ui_shows_every_tab_without_errors(seeded_db, sample_backlog):
     run_pipeline_once()
     app = open_ui()
     assert not app.exception
@@ -31,7 +31,28 @@ def test_ui_shows_every_tab_without_errors(seeded_db):
     assert len(app.expander) >= 12  # one card per order to review
 
 
-def test_reviewer_can_release_but_never_an_embargoed_order(seeded_db):
+def card_titles(app):
+    return [e.label for e in app.expander if "·" in e.label]
+
+
+def test_dummy_orders_come_last_and_no_uspo_is_shown_before_release(
+    seeded_db, sample_backlog
+):
+    from src.utils.mock_data import get_dummy_orders
+
+    for order in get_dummy_orders():
+        order_store.upsert_order(order)  # dummy orders seen first ...
+    run_pipeline_once()  # ... and the sample (real) orders after them
+    app = open_ui()
+    titles = card_titles(app)
+    dummy_positions = [i for i, title in enumerate(titles) if "dummy_" in title]
+    assert dummy_positions == list(range(len(titles) - 5, len(titles)))
+    assert all("🧪" in titles[i] for i in dummy_positions)
+    page = " ".join(str(element.value) for element in app.caption)
+    assert "USPO" not in page and "Arrow PO" not in page
+
+
+def test_reviewer_can_approve_but_never_an_embargoed_order(seeded_db, sample_backlog):
     run_pipeline_once()
     app = open_ui("Tester")
     approve = {button.key: button for button in app.button if "Approve" in button.label}
@@ -40,8 +61,23 @@ def test_reviewer_can_release_but_never_an_embargoed_order(seeded_db):
     assert approve[embargoed].disabled
     approve[clean].click().run()
     assert not app.exception
-    assert "REN-1103701 was released to Arrow." in [box.value for box in app.success]
-    assert order_store.get_order("REN-1103701") is None
+    assert any(
+        "REN-1103701 is approved" in box.value and "USPO" in box.value
+        for box in app.success
+    )
+    assert order_store.get_order("REN-1103701").status == "APPROVED"
+    waiting = [e for e in app.expander if "waiting for the USPO" in e.label]
+    assert waiting and "(1)" in waiting[0].label
+
+    sample_backlog["REN-1103701"] = "USPO46100"
+    run_pipeline_once()
+    app = open_ui("Tester")
+    assert not [e for e in app.expander if "waiting for the USPO" in e.label]
+    assert not any("REN-1103701" in title for title in card_titles(app))
+    all_orders = next(df.value for df in app.dataframe if "USPO" in df.value)
+    assert (
+        all_orders[all_orders["Order"] == "REN-1103701"]["USPO"].item() == "USPO46100"
+    )
 
 
 def test_new_rule_shows_up_marked_right_after_saving(seeded_db):

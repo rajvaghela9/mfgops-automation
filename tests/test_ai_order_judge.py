@@ -4,10 +4,10 @@ from unittest.mock import patch
 from src.intelligence_layer import ai_order_judge
 from src.intelligence_layer.llm_client import AiUnavailableError
 from src.intelligence_layer.rule_checks import RuleCheckResult
-from src.utils.mock_data import get_mock_orders
+from tests.sample_orders import get_sample_orders
 from src.utils.models import Rule, RuleFinding
 
-ORDER = get_mock_orders()[0]
+ORDER = get_sample_orders()[0]
 EMBARGO = RuleFinding(1, "Embargoed destination", "reject", "Embargoed.", False)
 SOFT_RULE = Rule(
     "Power cords per appliance", "soft", "reject", "d", guidance="Count cords."

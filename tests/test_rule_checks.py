@@ -13,13 +13,23 @@ from src.intelligence_layer.rule_checks import (
     verdict_from_findings,
 )
 from src.knowledge_layer import reference_store, rule_store
-from src.utils.mock_data import get_mock_orders, get_problem_demo_orders
+from src.utils.mock_data import (
+    CORD_EU,
+    CORD_US,
+    appliance,
+    get_dummy_orders,
+    make_line,
+    make_order,
+    power_cord,
+    power_supply,
+)
 from src.utils.models import Rule, RuleFinding
+from tests.sample_orders import get_sample_orders
 
 
 def checks_for(order_no):
     lists = reference_store.get_all_reference_lists()
-    order = next(order for order in get_mock_orders() if order.order_no == order_no)
+    order = next(order for order in get_sample_orders() if order.order_no == order_no)
     order.route = decide_route(order, lists)[0].value
     return check_order_against_rules(order, rule_store.get_rules(), lists)
 
@@ -30,7 +40,7 @@ def names(findings):
 
 def test_facts_match_documented_fact_list(seeded_db):
     facts = build_order_facts(
-        get_mock_orders()[0], reference_store.get_all_reference_lists()
+        get_sample_orders()[0], reference_store.get_all_reference_lists()
     )
     assert set(facts) == set(FACT_DESCRIPTIONS)
 
@@ -128,43 +138,158 @@ def test_find_rule_problems():
     assert find_rule_problems(bad_placeholder)
 
 
-def demo_checks(order_no):
+def checks_on(order):
     lists = reference_store.get_all_reference_lists()
-    order = next(o for o in get_problem_demo_orders() if o.order_no == order_no)
     order.route = decide_route(order, lists)[0].value
     return check_order_against_rules(order, rule_store.get_rules(), lists)
 
 
-def test_demo_orders_fail_or_hold(seeded_db):
-    assert len(get_problem_demo_orders()) == 10
-    for order_no in ["DIST-DEMO-0001", "DIST-DEMO-0002"]:  # embargo, banned customer
-        findings = demo_checks(order_no).findings
-        assert verdict_from_findings(findings) == "reject"
-        assert find_release_blocker(findings)
-    for order_no in ["REN-DEMO-0003", "FED-DEMO-0005", "DIST-DEMO-0006"]:
-        findings = demo_checks(order_no).findings
+def dummy_checks(order_no):
+    return checks_on(next(o for o in get_dummy_orders() if o.order_no == order_no))
+
+
+def test_dummy_orders_fail_or_hold(seeded_db):
+    assert [order.order_no for order in get_dummy_orders()] == [
+        "dummy_DIST-0001",
+        "dummy_REN-0002",
+        "dummy_REG-0003",
+        "dummy_FED-0004",
+        "dummy_DIST-0005",
+    ]
+    findings = dummy_checks("dummy_DIST-0001").findings  # embargoed Iran
+    assert verdict_from_findings(findings) == "reject"
+    assert find_release_blocker(findings)
+    for order_no, rule_name in [
+        ("dummy_REN-0002", "Power cord type matches the country"),
+        ("dummy_REG-0003", "Too few power cords"),
+        ("dummy_FED-0004", "SFP+ transceivers need a 10GE appliance"),
+    ]:
+        findings = dummy_checks(order_no).findings
+        assert rule_name in names(findings), order_no
         assert verdict_from_findings(findings) == "reject", order_no
         assert find_release_blocker(findings) is None
-    for order_no in ["DIST-DEMO-0007", "DIST-DEMO-0008"]:  # EUS needed
-        assert verdict_from_findings(demo_checks(order_no).findings) == "hold"
-
-
-def test_demo_orders_left_to_ai_judgement(seeded_db):
-    for order_no, rule_name in [
-        ("REG-DEMO-0004", "Power cords per appliance"),  # 2 TE-1606 need 4 cords
-        ("REG-DEMO-0010", "Power cords per appliance"),  # mixed cord types
-        ("DIST-DEMO-0009", "Letter-of-credit orders are held"),
-    ]:
-        checks = demo_checks(order_no)
-        assert rule_name in {rule.name for rule in checks.judgement_rules}, order_no
-    assert demo_checks("REG-DEMO-0004").facts["power_cord_count_ok"] is False
+    assert names(dummy_checks("dummy_DIST-0005").findings) == {"Approved EUS needed"}
 
 
 def test_real_item_class_names_count_cords(seeded_db):
     """Fusion calls them 'Hardware Base Units' and 'Power Supply Units'."""
-    facts = demo_checks("REG-DEMO-0004").facts
+    facts = dummy_checks("dummy_REG-0003").facts
     assert (facts["expected_power_cord_qty"], facts["power_cord_qty"]) == (4, 2)
-    assert demo_checks("FED-DEMO-0005").facts["sfp_compatible"] is False
+    assert dummy_checks("dummy_FED-0004").facts["sfp_compatible"] is False
     assert (
         checks_for("DIST-MOCK-0007").facts["has_10ge_appliance"] is True
     )  # "10GE" in SKU
+
+
+def us_order(lines, **overrides):
+    return make_order("REG-1", "Regular", "United States", "US", lines, **overrides)
+
+
+def test_power_cord_counts(seeded_db):
+    # Like REN-1104280: 4 x TE-1506 + 4 PSU (8 cords) and 9 x TE-906-HW-2AC (18).
+    lines = [
+        appliance(1, "TE-1506-HW-AC", 4),
+        power_supply(2, 4),
+        appliance(3, "TE-906-HW-2AC", 9),
+        power_cord(4, CORD_US, 26),
+        make_line(5, "IB-SFPPLUS-SR", "SFP+", 4, "Transceiver"),  # needs no cord
+    ]
+    assert checks_on(us_order(lines)).facts["expected_power_cord_qty"] == 26
+    one_cord_906 = [appliance(1, "TE-906-HW-AC"), power_cord(2, CORD_US, 2)]
+    checks = checks_on(us_order(one_cord_906))
+    assert names(checks.findings) == {"More power cords than needed"}
+    assert verdict_from_findings(checks.findings) == "hold"
+    mixed = [
+        appliance(1, "TE-1506-HW-AC", 2),
+        power_cord(2, CORD_US),
+        power_cord(3, CORD_EU),
+    ]
+    assert {"Mixed power cord types", "Power cord type matches the country"} <= names(
+        checks_on(us_order(mixed)).findings
+    )
+    spare_cords_only = [power_cord(1, CORD_US, 3)]
+    assert checks_on(us_order(spare_cords_only)).findings == []
+
+
+@pytest.mark.parametrize(
+    "country, code, cord",
+    [
+        ("Japan", "JP", "IB-POWER-CORD-14G-JP"),
+        ("Australia", "AU", "IB-POWER-CORD-14G-AUS"),
+        ("Singapore", "SG", "IB-POWER-CORD-14G-UK"),
+        ("Hong Kong", "HK", "IB-POWER-CORD-14G-UK"),
+        ("Italy", "IT", "IB-POWER-CORD-14G-CL"),
+        ("India", "IN", "IB-POWER-CORD-14G-INDIA"),
+        ("Spain", "ES", "IB-POWER-CORD-14G-EU"),
+    ],
+)
+def test_cord_type_per_country(seeded_db, country, code, cord):
+    order = make_order(
+        "DIST-1",
+        "Distributor",
+        country,
+        code,
+        [appliance(1, "TE-1506-HW-AC"), power_cord(2, (cord, "Power Cord"))],
+    )
+    assert checks_on(order).facts["cord_region_ok"] is True
+
+
+def test_embargoed_countries_and_regions_can_never_be_released(seeded_db):
+    lines = [appliance(1, "TE-1506-HW-AC"), power_cord(2, CORD_EU)]
+    russia = make_order("DIST-1", "Distributor", "Russia", "RU", lines)
+    assert "Embargoed destination" in names(checks_on(russia).findings)
+    crimea = make_order(
+        "DIST-2",
+        "Distributor",
+        "Ukraine",
+        "UA",
+        lines,
+        ship_to_address="1 Lenin St, Simferopol, Crimea",
+    )
+    findings = checks_on(crimea).findings
+    assert "Embargoed region" in names(findings) and find_release_blocker(findings)
+
+
+def test_power_supply_must_fit_an_appliance(seeded_db):
+    fits = [appliance(1, "TE-1506-HW-AC"), power_supply(2), power_cord(3, CORD_US, 2)]
+    assert checks_on(us_order(fits)).facts["psu_compatible"] is True
+    wrong = [appliance(1, "TE-906-HW-AC"), power_supply(2), power_cord(3, CORD_US, 2)]
+    assert "Power supply fits the appliance" in names(
+        checks_on(us_order(wrong)).findings
+    )
+    spare_psu_only = [power_supply(1), power_cord(2, CORD_US)]
+    assert checks_on(us_order(spare_psu_only)).facts["psu_compatible"] is None
+
+
+def test_collect_orders_need_forwarder_details(seeded_db):
+    lines = [appliance(1, "TE-1506-HW-AC"), power_cord(2, CORD_US)]
+    contact = "Ship to Contact: Kelly Cheng  Phone Number: 8610-82704326."
+    missing = us_order(lines, freight_terms="Collect", shipping_instructions=contact)
+    assert "Forwarder details for customer-routed freight" in names(
+        checks_on(missing).findings
+    )
+    for details in [
+        " SHIP VIA: Apex Logistics International Inc.",
+        " Please ship through DHL Account# 968823840.",
+        " UPS Acct # 6W7F69",
+        " Contact fra@hnfriends.com before shipping.",
+    ]:
+        given = us_order(
+            lines, freight_terms="Collect", shipping_instructions=contact + details
+        )
+        assert checks_on(given).facts["forwarder_details_present"] is True, details
+    prepaid = us_order(lines, shipping_instructions=contact)  # "Prepay & Add"
+    assert checks_on(prepaid).findings == []
+
+
+def test_ship_to_contact_name_is_required(seeded_db):
+    lines = [appliance(1, "TE-1506-HW-AC"), power_cord(2, CORD_US)]
+    no_name = us_order(
+        lines, shipping_instructions="Ship to Contact:  Phone Number: 555 0100"
+    )
+    assert "Missing ship-to contact name" in names(checks_on(no_name).findings)
+    named = us_order(
+        lines,
+        shipping_instructions="Ship to Contact: Shinya 吉田真也  Phone Number: +81 454 709 638",
+    )
+    assert checks_on(named).facts["ship_to_contact_present"] is True

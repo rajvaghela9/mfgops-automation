@@ -28,16 +28,39 @@ SPECIAL_INSTRUCTION_ROUTES = [
 
 
 class OrderStatus(str, Enum):
-    """Where an order is. RELEASED orders live only in the all_orders table."""
+    """Where an order is. RELEASED orders live only in the all_orders table.
+
+    APPROVED means a MfgOps user approved the order and released it in Fusion by hand;
+    it stays active until Fusion's USPO for it shows up in a backlog report mail.
+    REMOVED means the order disappeared from the Fusion backlog (e.g. cancelled).
+    """
 
     NEW = "NEW"
     WAITING_FOR_REVIEW = "WAITING_FOR_REVIEW"
     ON_HOLD = "ON_HOLD"
     SENT_TO_OM = "SENT_TO_OM"
+    APPROVED = "APPROVED"
     RELEASED = "RELEASED"
+    REMOVED = "REMOVED"
 
 
 REVIEWABLE_STATUSES = [OrderStatus.WAITING_FOR_REVIEW.value, OrderStatus.ON_HOLD.value]
+
+# Invented orders used to show the AI rejecting or holding orders. They never exist in
+# Fusion, so they are released straight away when approved (there is no USPO to wait for).
+DUMMY_ORDER_PREFIX = "dummy_"
+
+
+def is_dummy_order(order_no: str) -> bool:
+    """Tell whether an order number belongs to one of the invented demo orders.
+
+    Args:
+        order_no: Order number.
+
+    Returns:
+        True for dummy orders (their number starts with "dummy_").
+    """
+    return (order_no or "").startswith(DUMMY_ORDER_PREFIX)
 
 
 class Verdict(str, Enum):
@@ -141,6 +164,9 @@ class Order:
     decided_by: Optional[str] = None
     review_thread_id: Optional[str] = None
     rework_count: int = 0
+    approved_at: Optional[str] = None
+    # Backlog report mails in a row that no longer listed this order.
+    missing_snapshot_count: int = 0
     first_seen_at: Optional[str] = None
     last_updated_at: Optional[str] = None
     raw_json: str = ""
