@@ -39,9 +39,14 @@ def test_poll_loop_survives_a_failing_cycle():
     sleep.assert_called_once_with(5)
 
 
-def test_pipeline_runs_end_to_end_on_mock_data(seeded_db):
+def test_pipeline_runs_on_the_dummy_orders(seeded_db):
     summary = run_pipeline_once()
-    assert summary["sync"]["new"] == 14  # 15 mock orders minus 1 RMA
+    assert (summary["sync"]["new"], summary["reviewed"]) == (5, 5)
+
+
+def test_pipeline_runs_end_to_end_on_sample_data(seeded_db, sample_backlog):
+    summary = run_pipeline_once()
+    assert summary["sync"]["new"] == 14  # 15 sample orders minus 1 RMA
     assert summary["sync"]["excluded"] == 1
     assert summary["reviewed"] == 14
     assert not order_store.get_active_orders([OrderStatus.NEW.value])

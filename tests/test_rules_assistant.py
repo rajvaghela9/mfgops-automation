@@ -57,15 +57,15 @@ def test_saying_no_changes_nothing(seeded_db):
             {
                 "list_name": "embargoed_countries",
                 "action": "add",
-                "key": "ru",
-                "value": "Russia",
+                "key": "mm",
+                "value": "Myanmar",
             },
         ),
         text("OK."),
     ):
-        rules_assistant.send_chat_message("chat-2", "Embargo Russia", "Tester")
+        rules_assistant.send_chat_message("chat-2", "Embargo Myanmar", "Tester")
         rules_assistant.answer_change_request("chat-2", False)
-    assert "RU" not in reference_store.get_reference_list("embargoed_countries")
+    assert "MM" not in reference_store.get_reference_list("embargoed_countries")
 
 
 def test_change_and_remove_are_described_in_plain_words(seeded_db):

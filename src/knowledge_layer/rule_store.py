@@ -9,7 +9,7 @@ import json
 from dataclasses import asdict, fields
 from typing import Any, Dict, List, Optional
 
-from src.knowledge_layer.db import get_connection
+from src.knowledge_layer.db import get_app_setting, get_connection, set_app_setting
 from src.utils.logging_config import get_logger
 from src.utils.models import (
     EUS_ROUTES,
@@ -51,6 +51,24 @@ EDITABLE_FIELDS = [
 JENNIFER = "Jennifer Walker (order validation rules email)"
 TRADE_COMPLIANCE = "Seed list — confirm with Trade Compliance"
 MANDATORY_FIELDS = "Mandatory order fields (research plan)"
+RULES_THREAD = "Raj/Jennifer rules thread, 30 Sep 2026"
+
+CORD_GUIDANCE = (
+    "Cord counts are checked by fixed checks (too few = send to OM, too many or mixed "
+    "types = hold). Cords needed per unit: TE-1606, TE-2306, TE-4106 and TE-906-HW-2AC = "
+    "2 (dual power supplies); TE-1506 and TE-906-HW-AC = 1; each T-PSU600-AC power "
+    "supply = 1. Transceivers (SFP, SFP+) never need a cord. If expected_power_cord_qty "
+    "is unknown, name the appliance whose cord ratio is missing and hold only if the "
+    "count looks wrong."
+)
+SHIP_FROM_GUIDANCE = (
+    "Arrow ships from two places: Phoenix, US (Arrow Electronics, Inc.: US domestic, "
+    "Canada, and US-booked exports going through a forwarder in the US) and Budapest, "
+    "Hungary (Arrow Central Europe GmbH: EMEA and other international orders, including "
+    "standard 30-day APAC orders). Warn only when ship-from clearly doesn't fit, e.g. a "
+    "US or Canadian domestic order shipping from Central Europe, or a European order "
+    "shipping from Phoenix with no US forwarder. Never reject on this alone."
+)
 
 
 def hard_rule(name: str, outcome: str, description: str, **details) -> Rule:
@@ -151,6 +169,42 @@ SEED_RULES = [
         source=MANDATORY_FIELDS,
     ),
     hard_rule(
+        "Missing ship-to contact name",
+        RuleOutcome.REJECT.value,
+        "The shipping instructions must name the ship-to contact (the carrier needs it).",
+        category="mandatory_field",
+        conditions=[{"field": "ship_to_contact_present", "op": "eq", "value": False}],
+        message="Shipping instructions have no 'Ship to Contact:' name.",
+        source=RULES_THREAD,
+    ),
+    hard_rule(
+        "Forwarder details for customer-routed freight",
+        RuleOutcome.REJECT.value,
+        "Freight Collect orders must say who picks them up (forwarder or carrier account).",
+        category="shipping",
+        conditions=[
+            {"field": "customer_routed_freight", "op": "eq", "value": True},
+            {"field": "forwarder_details_present", "op": "eq", "value": False},
+        ],
+        message=(
+            "Freight terms are {freight_terms}, but the shipping instructions name no "
+            "freight forwarder, carrier account or contact email. Arrow needs them to "
+            "arrange the pickup."
+        ),
+        source=RULES_THREAD,
+    ),
+    hard_rule(
+        "Embargoed region",
+        RuleOutcome.REJECT.value,
+        "Orders for an embargoed region (Crimea, Donetsk, Luhansk) can never be released.",
+        category="embargo",
+        conditions=[{"field": "embargoed_region", "op": "exists"}],
+        message="The address is in an embargoed region ({embargoed_region}).",
+        can_be_overridden=False,
+        severity="critical",
+        source=RULES_THREAD,
+    ),
+    hard_rule(
         "Power cord type matches the country",
         RuleOutcome.REJECT.value,
         "Power cords must suit the destination country (e.g. no EU cords on a UK order).",
@@ -184,6 +238,55 @@ SEED_RULES = [
         source=JENNIFER + " (FED-1103664 was cancelled and rebooked)",
     ),
     hard_rule(
+        "Too few power cords",
+        RuleOutcome.REJECT.value,
+        "Each appliance and power supply ships with its power cords (e.g. TE-1606 = 2).",
+        category="power_cords",
+        conditions=[{"field": "too_few_power_cords", "op": "eq", "value": True}],
+        message=(
+            "The order has {power_cord_qty} power cord(s), but its appliances and power "
+            "supplies need {expected_power_cord_qty}."
+        ),
+        source=JENNIFER,
+    ),
+    hard_rule(
+        "More power cords than needed",
+        RuleOutcome.HOLD.value,
+        "Hold orders with more power cords than the appliances need, to check with OM.",
+        category="power_cords",
+        conditions=[{"field": "too_many_power_cords", "op": "eq", "value": True}],
+        message=(
+            "The order has {power_cord_qty} power cords, but its appliances and power "
+            "supplies need {expected_power_cord_qty}. Check with OM whether the extra "
+            "cords are intended."
+        ),
+        source=JENNIFER,
+    ),
+    hard_rule(
+        "Mixed power cord types",
+        RuleOutcome.HOLD.value,
+        "Hold orders with more than one power cord type, to check with OM.",
+        category="power_cords",
+        conditions=[{"field": "mixed_power_cord_types", "op": "eq", "value": True}],
+        message=(
+            "The order has more than one power cord type ({power_cord_regions}). "
+            "Check with OM."
+        ),
+        source=JENNIFER,
+    ),
+    hard_rule(
+        "Power supply fits the appliance",
+        RuleOutcome.HOLD.value,
+        "T-PSU600-AC fits TE-1506, TE-1606, TE-2205 and TE-2306 only.",
+        category="compatibility",
+        conditions=[{"field": "psu_compatible", "op": "eq", "value": False}],
+        message=(
+            "The order has {psu_qty} T-PSU600-AC power supply(ies), but none of its "
+            "appliances takes them (they fit TE-1506, TE-1606, TE-2205 and TE-2306)."
+        ),
+        source=RULES_THREAD,
+    ),
+    hard_rule(
         "Approved EUS needed",
         RuleOutcome.HOLD.value,
         "EUS orders are held until an approved End-Use Statement is linked.",
@@ -213,14 +316,7 @@ SEED_RULES = [
         "Power cords per appliance",
         RuleOutcome.REJECT.value,
         "Each appliance and power supply ships with the right number of power cords.",
-        guidance=(
-            "Cords needed per unit: TE-1606 = 2, TE-1506 = 1, each PSU (T-PSU600-AC) = 1; "
-            "TE-2306 and TE-906-2AC = 2 (inferred, not yet confirmed). Compare "
-            "power_cord_qty with expected_power_cord_qty. Fewer cords than needed: "
-            "reject so OM adds them. More cords than needed, or mixed cord types: hold "
-            "so the reviewer checks with OM. If a model's ratio is unknown, say which "
-            "model and only hold if the count looks wrong."
-        ),
+        guidance=CORD_GUIDANCE,
         category="power_cords",
         source=JENNIFER,
     ),
@@ -228,13 +324,9 @@ SEED_RULES = [
         "Ship-from and ship-to look right",
         RuleOutcome.WARN.value,
         "Ship-from and ship-to are checked on every order.",
-        guidance=(
-            "The exact rule is not confirmed yet. Only mention it if ship-from is given "
-            "and clearly doesn't fit the ship-to address or country. Never reject on "
-            "this alone."
-        ),
+        guidance=SHIP_FROM_GUIDANCE,
         category="shipping",
-        source=JENNIFER + " — exact rule to be confirmed",
+        source=RULES_THREAD,
     ),
     soft_rule(
         "Blue-ink sign and stamp (UAE, Qatar)",
@@ -276,7 +368,48 @@ SEED_RULES = [
         category="complex_order",
         source=JENNIFER,
     ),
+    soft_rule(
+        "1GbE SFP transceivers need SFP slots",
+        RuleOutcome.HOLD.value,
+        "IB-SFP-SX and IB-SFP-CO only fit appliances with 1GbE SFP slots.",
+        guidance=(
+            "If the order has IB-SFP-SX or IB-SFP-CO transceivers, they need an appliance "
+            "with 1GbE SFP slots; models with RJ-45 copper ports only can't take them. "
+            "If it isn't clear that the appliance on the order has SFP slots, hold so "
+            "the reviewer checks with OM."
+        ),
+        category="compatibility",
+        source=RULES_THREAD,
+    ),
 ]
+
+# Seed rules added after the first version; an existing database gets them once (a rule
+# with the same name, even retired, is never added again).
+RULES_SEED_VERSION = 2
+SEED_VERSION_SETTING = "rules_seed_version"
+ADDED_IN_SEED_VERSION = {
+    2: [
+        "Missing ship-to contact name",
+        "Forwarder details for customer-routed freight",
+        "Embargoed region",
+        "Too few power cords",
+        "More power cords than needed",
+        "Mixed power cord types",
+        "Power supply fits the appliance",
+        "1GbE SFP transceivers need SFP slots",
+    ]
+}
+# Seed rules whose content changed in a later version. Only applied to a seed rule that
+# nobody has edited since it was loaded (still version 1).
+CHANGED_IN_SEED_VERSION = {
+    2: {
+        "Power cords per appliance": {"guidance": CORD_GUIDANCE},
+        "Ship-from and ship-to look right": {
+            "guidance": SHIP_FROM_GUIDANCE,
+            "source": RULES_THREAD,
+        },
+    }
+}
 
 
 def row_to_rule(row) -> Rule:
@@ -489,4 +622,30 @@ def seed_default_rules() -> None:
         return
     for rule in SEED_RULES:
         add_rule(Rule(**asdict(rule)))
+    set_app_setting(SEED_VERSION_SETTING, str(RULES_SEED_VERSION))
     logger.info("Seeded %d default rules", len(SEED_RULES))
+
+
+def upgrade_seed_rules() -> None:
+    """Bring an existing database's rules up to the current seed version.
+
+    New seed rules are added; changed seed rules are updated only if nobody edited them.
+
+    Returns:
+        None.
+    """
+    stored = int(get_app_setting(SEED_VERSION_SETTING) or 1)
+    if stored >= RULES_SEED_VERSION:
+        return
+    seeds_by_name = {rule.name: rule for rule in SEED_RULES}
+    for version in range(stored + 1, RULES_SEED_VERSION + 1):
+        known_names = {rule.name for rule in get_rules(status=None)}
+        for name in ADDED_IN_SEED_VERSION.get(version, []):
+            if name not in known_names:
+                add_rule(Rule(**asdict(seeds_by_name[name])))
+        for name, changes in CHANGED_IN_SEED_VERSION.get(version, {}).items():
+            for rule in get_rules(status=None):
+                if rule.name == name and rule.version == 1:
+                    update_rule(rule.id, changes)
+    set_app_setting(SEED_VERSION_SETTING, str(RULES_SEED_VERSION))
+    logger.info("Rules upgraded to seed version %d", RULES_SEED_VERSION)

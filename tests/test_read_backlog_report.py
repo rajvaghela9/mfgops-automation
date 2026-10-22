@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -99,7 +100,7 @@ def test_file_mode_adds_the_demo_orders(tmp_path, monkeypatch):
         fetch_orders_from_fusion, "read_backlog_report", return_value=report_orders
     ):
         orders = fetch_orders_from_fusion.fetch_new_orders()
-        assert len(orders) == 1 + 10 and orders[0].order_no == "DIST-1"
+        assert len(orders) == 1 + 5 and orders[0].order_no == "DIST-1"
         monkeypatch.setenv("INCLUDE_DEMO_ORDERS", "false")
         assert len(fetch_orders_from_fusion.fetch_new_orders()) == 1
 
@@ -109,3 +110,30 @@ def test_file_mode_needs_a_path(monkeypatch):
     monkeypatch.setenv("BACKLOG_FILE_PATH", "")
     with pytest.raises(RuntimeError, match="BACKLOG_FILE_PATH"):
         fetch_orders_from_fusion.fetch_new_orders()
+
+
+def fake_workbook(headings):
+    cells = [SimpleNamespace(value=heading) for heading in headings]
+    sheet = SimpleNamespace(row=lambda number: cells, nrows=1)
+    return SimpleNamespace(sheet_by_index=lambda index: sheet)
+
+
+def test_a_changed_report_layout_is_explained(tmp_path):
+    from src.integration_layer import read_backlog_report as reader
+
+    report = tmp_path / "report.xls"
+    report.write_bytes(b"")
+    headings = [heading for heading in reader.REQUIRED_HEADINGS if heading != "FOB"]
+    with patch.object(
+        reader.xlrd, "open_workbook", return_value=fake_workbook(headings)
+    ):
+        with pytest.raises(
+            ValueError, match="missing these backlog report columns: FOB"
+        ):
+            read_backlog_report(str(report))
+    with patch.object(
+        reader.xlrd,
+        "open_workbook",
+        return_value=fake_workbook(reader.REQUIRED_HEADINGS + ["Booked Date"]),
+    ):
+        assert read_backlog_report(str(report)) == []  # every column there, no rows

@@ -35,9 +35,10 @@ doesn't fit the order.
 
 Notes on the data: it comes from the Fusion backlog report, which doesn't include the \
 customer's own PO number or the end-customer country, so "not provided" for those is \
-normal, not a problem. "Ship from: ARROW" is just the warehouse and says nothing about \
-whether the order was sent. Only mention that an order was already sent to Arrow if the \
-order says so explicitly; judge the order on its content.
+normal, not a problem. Every order you see is still waiting to be released to Arrow; \
+"Ship from: ARROW ..." is only the Arrow warehouse it will ship from (Arrow Electronics, \
+Inc. in Phoenix, US, or Arrow Central Europe GmbH in Budapest, Hungary). Judge the order \
+on its content.
 
 Write for operations people, not IT staff: plain words, no field names, no code, no \
 JSON in the text. Keep the summary to one or two sentences. Give each reason as one \
@@ -57,15 +58,10 @@ def describe_order(order: Order) -> str:
     Returns:
         The order details.
     """
-    arrow_status = (
-        f"Already sent to Arrow (Arrow PO {order.arrow_po})"
-        if order.arrow_po
-        else "Not sent to Arrow yet"
-    )
     lines = "\n".join(
         f"  - line {line.line_number}: {line.ordered_qty} x {line.sku} "
         f"({line.item_description}; {line.item_class})"
-        for line in order.lines
+        for line in sorted(order.lines, key=lambda line: line.line_number)
     )
     return (
         f"Order {order.order_no} ({order.order_type}), booked {order.booked_date}\n"
@@ -75,7 +71,7 @@ def describe_order(order: Order) -> str:
         f"{order.ship_to_country}\n"
         f"Ship from: {order.ship_from or 'not given'}\n"
         f"Customer PO: {order.customer_po or 'not provided'} | "
-        f"{arrow_status} | FOB: {order.fob or 'missing'} | "
+        f"FOB: {order.fob or 'missing'} | "
         f"Freight terms: {order.freight_terms or 'missing'} | "
         f"Shipping method: {order.shipping_method or 'missing'}\n"
         f"Shipping instructions: {order.shipping_instructions or 'none'}\n"

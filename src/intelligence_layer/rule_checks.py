@@ -29,7 +29,16 @@ SFP_PLUS_SKU_PREFIX = "IB-SFPPLUS"
 # Fusion calls these "Hardware Base Units" and "Power Supply Units"; match on the start.
 CORD_NEEDING_ITEM_CLASSES = ("HARDWARE BASE", "POWER SUPPLY")
 APPLIANCE_ITEM_CLASS = "HARDWARE BASE"
+PSU_SKU_PREFIX = "T-PSU600"
 PHONE_PATTERN = re.compile(r"phone[^0-9+]*\+?[\d][\d\s\-().]{5,}", re.IGNORECASE)
+CONTACT_PATTERN = re.compile(r"ship\s*to\s*contact\s*:", re.IGNORECASE)
+# Signs that the shipping instructions say who picks the order up: a forwarder, a
+# carrier account number, "ship via", or a contact email address.
+FORWARDER_PATTERN = re.compile(
+    r"forwarder|logistics|freight|expeditors|ship\s*via|account|acct|acc\s*#|a/c"
+    r"|[\w.+-]+@[\w-]+\.[\w.]+",
+    re.IGNORECASE,
+)
 SUPPORTED_OPERATORS = ["eq", "neq", "in", "not_in", "exists", "missing", "gt", "lt"]
 
 # Every fact a rule can use. Keep in sync with build_order_facts (a test checks this).
@@ -48,11 +57,22 @@ FACT_DESCRIPTIONS = {
     "freight_terms": "Freight terms",
     "customer_po": "Customer PO number",
     "ship_to_phone_present": "True if shipping instructions contain a phone number",
+    "ship_to_contact_present": "True if shipping instructions name a ship-to contact",
+    "customer_routed_freight": "True when freight terms are Collect (customer's carrier)",
+    "forwarder_details_present": (
+        "True if shipping instructions name a forwarder, carrier account or contact email"
+    ),
     "is_embargoed_destination": "True if destination is on the embargoed list",
     "is_banned_customer": "True if the bill-to or ship-to customer is on the banned list",
+    "embargoed_region": "Embargoed region named in the addresses (e.g. Crimea), if any",
     "power_cord_qty": "Total power cords on the order",
     "expected_power_cord_qty": "Cords needed by appliances and PSUs (None if unknown)",
     "power_cord_count_ok": "True/False, or None when a ratio is unknown",
+    "too_few_power_cords": "True when fewer cords than needed (None if unknown)",
+    "too_many_power_cords": (
+        "True when more cords than needed (None if unknown or nothing needs cords)"
+    ),
+    "mixed_power_cord_types": "True when the order has more than one cord type",
     "power_cord_regions": "Cord regions on the order, e.g. 'US' or 'EU, US'",
     "expected_cord_region": "Cord region the destination needs (None if unmapped)",
     "cord_region_known": "False when there are cords but the destination is unmapped",
@@ -60,6 +80,11 @@ FACT_DESCRIPTIONS = {
     "sfp_plus_qty": "Total SFP+ (10GE) transceivers",
     "has_10ge_appliance": "True if an appliance has 10GE ports ('10GE' in SKU or on the list)",
     "sfp_compatible": "False when SFP+ is ordered without a 10GE appliance",
+    "psu_qty": "Total T-PSU600-AC power supplies",
+    "psu_compatible": (
+        "False when PSUs are ordered with appliances that can't take them "
+        "(None if no PSU or no appliance)"
+    ),
     "documents_received": "True once OM's order mail is matched (not automated yet)",
     "eus_case_id": "Linked approved EUS case, if any",
 }
@@ -132,6 +157,12 @@ def build_power_cord_facts(
         "power_cord_qty": power_cord_qty,
         "expected_power_cord_qty": expected,
         "power_cord_count_ok": None if expected is None else power_cord_qty == expected,
+        "too_few_power_cords": None if expected is None else power_cord_qty < expected,
+        # Spare cords on an order with nothing that needs cords are not "too many".
+        "too_many_power_cords": (
+            None if expected is None or expected == 0 else power_cord_qty > expected
+        ),
+        "mixed_power_cord_types": len(regions) > 1 if has_cords else None,
         "power_cord_regions": ", ".join(regions) or "no",
         "expected_cord_region": expected_region,
         "cord_region_known": (expected_region is not None) if has_cords else None,
@@ -141,6 +172,76 @@ def build_power_cord_facts(
             else None
         ),
     }
+
+
+def has_ship_to_contact(shipping_instructions: str) -> bool:
+    """Tell whether the shipping instructions name a ship-to contact.
+
+    Args:
+        shipping_instructions: The order's shipping instructions text.
+
+    Returns:
+        True when "Ship to Contact:" is followed by a name (before "Phone" or ".").
+    """
+    match = CONTACT_PATTERN.search(shipping_instructions or "")
+    if not match:
+        return False
+    rest = shipping_instructions.partition(match.group(0))[2]
+    name = re.split(r"phone|\.\s", rest, maxsplit=1, flags=re.IGNORECASE)[0]
+    return any(character.isalnum() for character in name)
+
+
+def find_embargoed_region(
+    order: Order, lists: Dict[str, Dict[str, str]]
+) -> Optional[str]:
+    """Look for an embargoed region (e.g. Crimea) in the order's addresses.
+
+    Args:
+        order: The order.
+        lists: All reference lists.
+
+    Returns:
+        The region's name from the list, or None.
+    """
+    text = " ".join(
+        [order.ship_to_address, order.ship_to_country, order.bill_to_address]
+    ).upper()
+    for key, name in lists.get(reference_store.EMBARGOED_REGIONS, {}).items():
+        if re.search(rf"\b{re.escape(key.upper())}\b", text):
+            return name or key
+    return None
+
+
+def build_power_supply_facts(
+    order: Order, lists: Dict[str, Dict[str, str]]
+) -> Dict[str, Any]:
+    """Work out whether the order's T-PSU600-AC power supplies fit its appliances.
+
+    Args:
+        order: The order.
+        lists: All reference lists.
+
+    Returns:
+        psu_qty and psu_compatible (see FACT_DESCRIPTIONS).
+    """
+    psu_qty = sum(
+        line.ordered_qty
+        for line in order.lines
+        if line.sku.upper().startswith(PSU_SKU_PREFIX)
+    )
+    appliances = [
+        line
+        for line in order.lines
+        if line.item_class.upper().startswith(APPLIANCE_ITEM_CLASS)
+    ]
+    compatible_list = lists.get(reference_store.PSU_COMPATIBLE_APPLIANCES, {})
+    compatible = None
+    if psu_qty and appliances:
+        compatible = any(
+            match_sku_prefix(line.sku, compatible_list) is not None
+            for line in appliances
+        )
+    return {"psu_qty": psu_qty, "psu_compatible": compatible}
 
 
 def build_order_facts(order: Order, lists: Dict[str, Dict[str, str]]) -> Dict[str, Any]:
@@ -184,6 +285,11 @@ def build_order_facts(order: Order, lists: Dict[str, Dict[str, str]]) -> Dict[st
         "ship_to_phone_present": bool(
             PHONE_PATTERN.search(order.shipping_instructions or "")
         ),
+        "ship_to_contact_present": has_ship_to_contact(order.shipping_instructions),
+        "customer_routed_freight": "COLLECT" in (order.freight_terms or "").upper(),
+        "forwarder_details_present": bool(
+            FORWARDER_PATTERN.search(order.shipping_instructions or "")
+        ),
         "is_embargoed_destination": (
             destination in lists.get(reference_store.EMBARGOED_COUNTRIES, {})
             if destination
@@ -193,6 +299,7 @@ def build_order_facts(order: Order, lists: Dict[str, Dict[str, str]]) -> Dict[st
             banned in customers
             for banned in lists.get(reference_store.BANNED_CUSTOMERS, {})
         ),
+        "embargoed_region": find_embargoed_region(order, lists),
         "sfp_plus_qty": sfp_qty,
         "has_10ge_appliance": has_10ge,
         "sfp_compatible": has_10ge if sfp_qty else None,
@@ -200,6 +307,7 @@ def build_order_facts(order: Order, lists: Dict[str, Dict[str, str]]) -> Dict[st
         "eus_case_id": order.eus_case_id,
     }
     facts.update(build_power_cord_facts(order, lists))
+    facts.update(build_power_supply_facts(order, lists))
     return facts
 
 
