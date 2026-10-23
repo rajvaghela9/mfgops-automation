@@ -33,6 +33,19 @@ class Config:
     litellm_base_url: Optional[str]
     litellm_api_key: Optional[str]
     litellm_model: Optional[str]
+    graph_api_tenant_id: Optional[str]
+    graph_api_client_id: Optional[str]
+    graph_api_client_secret: Optional[str]
+    graph_api_mailbox: Optional[str]
+    graph_api_folder: str
+    graph_api_sender_mailbox: Optional[str]
+    backlog_sender: str
+    backlog_subject: str
+    backlog_attachment_name: str
+    backlog_attachment_keep: int
+    email_redirect_to: Optional[str]
+    arrow_recipient_email: Optional[str]
+    uspo_wait_warning_minutes: int
 
     @property
     def llm_enabled(self) -> bool:
@@ -44,6 +57,29 @@ class Config:
         return bool(
             self.litellm_base_url and self.litellm_api_key and self.litellm_model
         )
+
+    @property
+    def graph_enabled(self) -> bool:
+        """Tell whether every MS Graph setting needed to read or send mail is present.
+
+        Returns:
+            True when tenant id, client id, client secret and mailbox are all set.
+        """
+        return bool(
+            self.graph_api_tenant_id
+            and self.graph_api_client_id
+            and self.graph_api_client_secret
+            and self.graph_api_mailbox
+        )
+
+    @property
+    def sender_mailbox(self) -> Optional[str]:
+        """The mailbox outgoing mail is sent from.
+
+        Returns:
+            GRAPH_API_SENDER_MAILBOX, or the monitored mailbox when it isn't set.
+        """
+        return self.graph_api_sender_mailbox or self.graph_api_mailbox
 
 
 def read_setting(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -110,4 +146,23 @@ def load_config() -> Config:
         litellm_base_url=read_setting("LITELLM_BASE_URL"),
         litellm_api_key=read_setting("LITELLM_API_KEY"),
         litellm_model=read_setting("LITELLM_MODEL"),
+        graph_api_tenant_id=read_setting("GRAPH_API_TENANT_ID"),
+        graph_api_client_id=read_setting("GRAPH_API_CLIENT_ID"),
+        graph_api_client_secret=read_setting("GRAPH_API_CLIENT_SECRET"),
+        graph_api_mailbox=read_setting("GRAPH_API_MAILBOX"),
+        graph_api_folder=read_setting("GRAPH_API_FOLDER", "inbox"),
+        graph_api_sender_mailbox=read_setting("GRAPH_API_SENDER_MAILBOX"),
+        backlog_sender=read_setting(
+            "BACKLOG_SENDER", "efpv.bi.sender@workflow.mail.us6.oraclecloud.com"
+        ).lower(),
+        backlog_subject=read_setting(
+            "BACKLOG_SUBJECT", "Infoblox Orders Backlog Report"
+        ),
+        backlog_attachment_name=read_setting(
+            "BACKLOG_ATTACHMENT_NAME", "Infoblox Orders Backlog Report.xls"
+        ),
+        backlog_attachment_keep=int(read_setting("BACKLOG_ATTACHMENT_KEEP", "20")),
+        email_redirect_to=read_setting("EMAIL_REDIRECT_TO"),
+        arrow_recipient_email=read_setting("ARROW_RECIPIENT_EMAIL"),
+        uspo_wait_warning_minutes=int(read_setting("USPO_WAIT_WARNING_MINUTES", "60")),
     )

@@ -46,6 +46,14 @@ LINE_TEXT_COLUMNS = {
     "serial_number": "Serial Number",
     "work_order": "Work Order",
 }
+# Every heading the review needs. If Fusion changes the report layout, reading stops
+# with a clear message instead of silently reviewing orders with empty fields.
+REQUIRED_HEADINGS = sorted(
+    {"Order Number", "Line Number", "Ordered Qty", "Selling Price"}
+    | set(ORDER_COLUMNS.values())
+    | set(DATE_COLUMNS.values())
+    | set(LINE_TEXT_COLUMNS.values())
+)
 
 
 def read_text(row: Dict[str, Any], column: str) -> str:
@@ -107,6 +115,12 @@ def read_sheet_rows(path: Path) -> List[Dict[str, Any]]:
     if "Order Number" not in headings:
         raise ValueError(
             f"{path.name} doesn't look like an Orders Backlog Report: no 'Order Number' column."
+        )
+    missing = [heading for heading in REQUIRED_HEADINGS if heading not in headings]
+    if missing:
+        raise ValueError(
+            f"{path.name} is missing these backlog report columns: {', '.join(missing)}. "
+            "Has the Fusion report layout changed?"
         )
     first_column = {}
     for index, heading in enumerate(headings):
