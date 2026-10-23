@@ -34,6 +34,7 @@ from src.send_attachment import (
 )
 from src.knowledge_layer import (
     attachment_store,
+    eus_document_store,
     learning_request_store,
     mail_attachment_store,
     mail_store,
@@ -888,6 +889,7 @@ def list_eus_attachments() -> list:
     folder = eus_attachment_dir()
     attachment_store.migrate_files(folder)
     attachment_store.materialize_attachments(folder)
+    eus_document_store.sync_documents()
     if not folder.is_dir():
         return []
     files = [
@@ -978,7 +980,12 @@ def handle_eus_fetch() -> None:
         )
 
 
-def handle_eus_decision(relative_path: str, decision: str, reviewer: str) -> None:
+def handle_eus_decision(
+    relative_path: str,
+    decision: str,
+    reviewer: str,
+    comment_key: Optional[str] = None,
+) -> None:
     """Forward one EUS attachment with the reviewer's decision and comments.
 
     Args:
@@ -990,7 +997,9 @@ def handle_eus_decision(relative_path: str, decision: str, reviewer: str) -> Non
         None. The outcome is kept for the next redraw to show.
     """
     file_name = Path(relative_path).name
-    comment = st.session_state.get(f"eus_comment_{relative_path}", "").strip()
+    comment = st.session_state.get(
+        comment_key or f"eus_comment_{relative_path}", ""
+    ).strip()
     if decision == "reject" and not comment:
         st.session_state["flash_error"] = (
             f"{file_name}: add a comment before rejecting."
@@ -1179,6 +1188,17 @@ def handle_special_instruction_share(folder_name: str, reviewer: str) -> None:
             + ", ".join(unapproved)
         )
         return
+    # The EUS is forwarded on its own when approved; instructions go with PO/Quote.
+    files = [
+        path
+        for path in files
+        if review.document_types.get(path.name) in {"po", "quote"}
+    ]
+    if not files:
+        st.session_state["flash_error"] = (
+            "No PO or Quote was identified to share with the special instructions."
+        )
+        return
     body_type = str(metadata.get("body_content_type") or "text")
     original_body = str(metadata.get("body") or "")
     if body_type.lower() == "html":
@@ -1269,13 +1289,13 @@ def render_special_instruction_share(
             disabled_reason = "Approve the EUS before sharing this package."
         elif eus_names:
             st.info(
-                "The approved EUS will be shared with the special instructions, "
-                "PO, and Quote."
+                "The EUS is approved. Special instructions are shared with the "
+                "PO and Quote only; the EUS was forwarded separately."
             )
         else:
             st.info(
-                "No EUS was identified. The special instructions, PO, and Quote "
-                "can be shared without an EUS."
+                "No EUS was identified. The special instructions are shared with "
+                "the PO and Quote."
             )
     st.button(
         "📤 Share special instructions",
@@ -1294,6 +1314,7 @@ def render_eus_mail_group(
     received_label: Optional[str],
     files: list,
     reviewer: str,
+    key_prefix: str = "",
 ) -> None:
     """Show one email as a heading with every attachment that came with it.
 
@@ -1315,7 +1336,7 @@ def render_eus_mail_group(
         st.subheader(f"📧 {folder_name}")
         st.caption(f"{len(files)} attachment(s)")
     review = (
-        render_eus_automated_review(folder_name, files)
+        render_eus_automated_review(folder_name, files, key_prefix)
         if folder_name is not None
         else None
     )
@@ -1323,21 +1344,23 @@ def render_eus_mail_group(
         document_type = (
             review.document_types.get(attachment_path.name) if review else None
         )
-        render_eus_attachment_card(attachment_path, reviewer, document_type)
-    if folder_name is not None:
+        render_eus_attachment_card(
+            attachment_path, reviewer, document_type, key_prefix
+        )
+    if folder_name is not None and not key_prefix:
         render_special_instruction_share(folder_name, review, reviewer)
     st.divider()
 
 
 def render_eus_automated_review(
-    folder_name: str, files: list
+    folder_name: str, files: list, key_prefix: str = ""
 ) -> Optional[eus_document_review.EusReview]:
     """Show automated checks for one email's document set."""
     state_key = f"eus_automated_review_{folder_name}"
     error_key = f"{state_key}_error"
     if st.button(
         "🔄 Re-run automated EUS checks",
-        key=f"run_{state_key}",
+        key=f"{key_prefix}run_{state_key}",
         width="stretch",
     ):
         perform_eus_review(folder_name, files)
@@ -1356,13 +1379,37 @@ def render_eus_automated_review(
         )
         return None
 
-    if review.passed:
+    failed_checks = [check for check in review.checks if not check.passed]
+    status = (
+        "✅ passed" if review.passed else f"❌ {len(failed_checks)} check(s) failed"
+    )
+    with st.expander(f"🧾 Automated EUS checks — {status}", expanded=False):
+        render_eus_review_details(review, failed_checks)
+    return review
+
+
+def render_eus_review_details(
+    review: eus_document_review.EusReview, failed_checks: list
+) -> None:
+    """Render the result and individual checks of one automated review."""
+    confidence = f"{review.confidence:.0%}"
+    if review.repeat_customer:
+        st.info(
+            f"🔁 Repeat customer: {review.end_user_name} already has an approved "
+            f"EUS. Confidence {confidence} (needs "
+            f"{eus_document_review.REPEAT_CUSTOMER_CONFIDENCE:.0%})."
+        )
+    if review.passed and not failed_checks:
         st.success("All automated EUS checks passed.")
+    elif review.passed:
+        st.success(
+            f"Repeat customer confidence {confidence} meets the threshold."
+        )
     else:
         st.warning(
             "One or more automated checks failed. Review the details before overriding."
         )
-        failed_checks = [check for check in review.checks if not check.passed]
+    if failed_checks:
         st.error(
             "**Failed checks:**\n\n"
             + "\n".join(
@@ -1378,7 +1425,6 @@ def render_eus_automated_review(
     for check in review.checks:
         marker = "✅" if check.passed else "❌"
         st.markdown(f"{marker} **{check.label}** — {check.details}")
-    return review
 
 
 def perform_eus_review(folder_name: str, files: list) -> None:
@@ -1388,9 +1434,24 @@ def perform_eus_review(folder_name: str, files: list) -> None:
     st.session_state.pop(error_key, None)
     try:
         with st.spinner("Reading and comparing the EUS, quote, and PO..."):
-            st.session_state[state_key] = (
-                eus_document_review.review_mail_documents(files)
+            review = eus_document_review.review_mail_documents(
+                files,
+                is_repeat_customer=lambda name: (
+                    eus_document_store.is_repeat_customer(
+                        name, exclude_folder=folder_name
+                    )
+                ),
             )
+            st.session_state[state_key] = review
+            eus_document_store.set_document_types(
+                folder_name, review.document_types
+            )
+            if review.end_user_name:
+                for file_name, document_type in review.document_types.items():
+                    if document_type == "eus":
+                        eus_document_store.set_end_user(
+                            folder_name, file_name, review.end_user_name
+                        )
     except eus_document_review.EusReviewError as error:
         st.session_state.pop(state_key, None)
         st.session_state[error_key] = str(error)
@@ -1400,6 +1461,7 @@ def render_eus_attachment_card(
     attachment_path: Path,
     reviewer: str,
     document_type: Optional[str] = None,
+    key_prefix: str = "",
 ) -> None:
     """Show one EUS attachment with its preview and the decision buttons.
 
@@ -1426,16 +1488,21 @@ def render_eus_attachment_card(
     title = f"{icon} {file_name}"
     if decided:
         title += f" · {decided['verdict']}"
-    with st.expander(title):
+    expander = st.expander(
+        title, key=f"{key_prefix}eus_expander_{relative_path}", on_change="rerun"
+    )
+    with expander:
         st.caption(f"{attachment_path.stat().st_size / 1024:,.0f} KB")
         st.download_button(
             "⬇️ Download",
             data=attachment_path.read_bytes(),
             file_name=file_name,
-            key=f"eus_download_{relative_path}",
+            key=f"{key_prefix}eus_download_{relative_path}",
             width="stretch",
         )
-        render_eus_preview(attachment_path)
+        # Embedded PDF viewers float their toolbars outside collapsed expanders.
+        if expander.open:
+            render_eus_preview(attachment_path)
         st.divider()
         if decided:
             st.success(
@@ -1451,10 +1518,11 @@ def render_eus_attachment_card(
                 "email-level EUS checks and does not need a separate decision."
             )
             return
-        with st.form(key=f"eus_decision_{relative_path}"):
+        comment_key = f"{key_prefix}eus_comment_{relative_path}"
+        with st.form(key=f"{key_prefix}eus_decision_{relative_path}"):
             st.text_area(
                 "Your comment (needed when rejecting)",
-                key=f"eus_comment_{relative_path}",
+                key=comment_key,
                 placeholder="e.g. the EUS is missing the end customer's signature",
             )
             approve, reject = st.columns(2)
@@ -1463,14 +1531,14 @@ def render_eus_attachment_card(
                 disabled=not reviewer,
                 width="stretch",
                 on_click=handle_eus_decision,
-                args=(relative_path, "approve", reviewer),
+                args=(relative_path, "approve", reviewer, comment_key),
             )
             reject.form_submit_button(
                 "⛔ Reject & forward",
                 disabled=not reviewer,
                 width="stretch",
                 on_click=handle_eus_decision,
-                args=(relative_path, "reject", reviewer),
+                args=(relative_path, "reject", reviewer, comment_key),
             )
         if not reviewer:
             st.caption("Enter your name in the sidebar to enable the buttons.")
@@ -1503,12 +1571,31 @@ def render_eus_approval_tab(reviewer: str) -> None:
         )
         return
     groups = group_eus_attachments_by_mail(attachments)
-    st.caption(
-        f"{len(attachments)} attachment(s) from {len(groups)} email(s) "
-        f"in {eus_attachment_dir()}/"
-    )
-    for folder_name, received_label, files in groups:
-        render_eus_mail_group(folder_name, received_label, files, reviewer)
+    active_tab, all_tab = st.tabs(["Active EUS documents", "All EUS documents"])
+    with active_tab:
+        active_folders = eus_document_store.get_active_folders()
+        active_groups = [
+            group for group in groups if group[0] in active_folders
+        ]
+        if not active_groups:
+            st.success("No active EUS documents. Every email has been reviewed.")
+        else:
+            st.caption(f"{len(active_groups)} email(s) waiting for review.")
+            for folder_name, received_label, files in active_groups:
+                render_eus_mail_group(
+                    folder_name,
+                    received_label,
+                    files,
+                    reviewer,
+                    key_prefix="active_",
+                )
+    with all_tab:
+        st.caption(
+            f"{len(attachments)} attachment(s) from {len(groups)} email(s) "
+            f"in {eus_attachment_dir()}/"
+        )
+        for folder_name, received_label, files in groups:
+            render_eus_mail_group(folder_name, received_label, files, reviewer)
 
 
 def main() -> None:
@@ -1530,6 +1617,10 @@ def main() -> None:
         st.sidebar.warning(
             f"🔔 The AI has {to_learn} question(s) for you in Rules Assistant"
         )
+    eus_waiting = eus_document_store.count_waiting_folders()
+    st.sidebar.info(
+        f"🛂 {eus_waiting} EUS document(s) waiting for approval."
+    )
     # Fixed tab names, so the open tab stays open after every button click.
     tabs = st.tabs(
         [

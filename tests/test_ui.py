@@ -322,8 +322,18 @@ def test_eus_automated_checks_show_pass_and_fail_results(seeded_db):
     results = "\n".join(markdown.value for markdown in app.markdown)
     assert "✅ **EUS details match quote**" in results
     assert '❌ **Question 6 has "No" selected**' in results
+    check_expanders = [
+        expander
+        for expander in app.expander
+        if expander.label.startswith("🧾 Automated EUS checks")
+    ]
+    assert check_expanders
+    assert all(
+        expander.label.endswith("1 check(s) failed") for expander in check_expanders
+    )
+    all_tab = next(tab for tab in app.tabs if tab.label == "All EUS documents")
     assert len(
-        [button for button in app.button if "Approve & forward" in button.label]
+        [button for button in all_tab.button if "Approve & forward" in button.label]
     ) == 1
 
 
@@ -419,13 +429,21 @@ def test_special_instructions_wait_for_eus_approval(seeded_db):
     attachment_store.record_decision(
         f"{folder}/invoice.pdf", "approve", "Tester"
     )
-    app.run()
-    share = next(
-        button
-        for button in app.button
-        if "Share special instructions" in button.label
-    )
-    assert not share.disabled
+    load, token, send = patched_package_sender()
+    # Callbacks use the previous run's globals, so patch before that run.
+    with load, token, send as sender:
+        app.run()
+        share = next(
+            button
+            for button in app.button
+            if "Share special instructions" in button.label
+        )
+        assert not share.disabled
+        share.click().run()
+
+    assert not app.exception
+    sender.assert_called_once()
+    assert [path.name for path in sender.call_args.args[5]] == ["packing-list.txt"]
 
 
 def test_eus_reject_without_a_comment_sends_nothing(seeded_db):
@@ -459,3 +477,34 @@ def test_eus_reject_forwards_the_comment(seeded_db):
     assert saved["decision"] == "reject"
     assert saved["decided_by"] == "Tester"
     assert saved["comment"] == "Signature missing"
+
+
+def test_eus_approval_has_active_then_all_document_tabs(seeded_db):
+    approved = prepare_eus_attachment("20261015_120000_message_1/approved.pdf")
+    sibling = prepare_eus_attachment("20261015_120000_message_1/quote.pdf")
+    active = prepare_eus_attachment("20261016_120000_message_2/active.pdf")
+    prepare_eus_attachment("20261016_120000_message_2/active-po.pdf")
+
+    app = open_ui("Tester")
+    attachment_store.record_decision(approved, "approve", "Tester")
+    app.run()
+
+    assert not app.exception
+    tab_labels = [tab.label for tab in app.tabs]
+    assert tab_labels.index("Active EUS documents") + 1 == tab_labels.index(
+        "All EUS documents"
+    )
+    all_tab = next(tab for tab in app.tabs if tab.label == "All EUS documents")
+    active_tab = next(tab for tab in app.tabs if tab.label == "Active EUS documents")
+    all_labels = [expander.label for expander in all_tab.expander]
+    active_labels = [expander.label for expander in active_tab.expander]
+    for path in (approved, sibling, active):
+        assert any(Path(path).name in label for label in all_labels)
+    # One decided file moves its whole email folder out of Active.
+    assert not any(Path(approved).name in label for label in active_labels)
+    assert not any(Path(sibling).name in label for label in active_labels)
+    assert any(Path(active).name in label for label in active_labels)
+    assert "1 EUS document(s) waiting for approval." in [
+        box.value for box in app.sidebar.info
+    ]
+    assert not any("<iframe" in markdown.value for markdown in app.markdown)

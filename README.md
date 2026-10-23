@@ -245,17 +245,26 @@ directory is a materialized cache used by the document preview and review
 flows; deleting a cached file does not delete the SQLite copy, and the UI
 restores it from SQLite when it next loads.
 
+The **EUS Approval** tab has two views. **Active EUS documents** (left) shows complete email folders in which no
+document has been approved or rejected yet; **All EUS documents** (right)
+shows every downloaded document grouped by email. Approving or rejecting any
+file moves its whole email folder out of Active. This queue state is stored
+in the `eus_documents` table.
+
 ### Automated EUS checks
 
 For each newly downloaded timestamped email folder, the application automatically
 extracts and compares text-searchable PDF attachments. The **EUS Approval** tab
-shows the results and provides a **Re-run automated EUS checks** control when a
-manual rerun is needed:
+shows the results in a collapsible **Automated EUS checks** section. It starts
+minimized, and its title shows whether all checks passed or how many failed.
+A **Re-run automated EUS checks** control is available when a manual rerun is
+needed:
 
 - identify one EUS and at least one supporting PO or Quote; each supporting
   document is optional when the other is present;
-- compare the EUS quote number, quantity, part, and partner SKU wherever they
-  appear against the available PO and/or Quote; a match with either one passes;
+- compare the EUS quote number against the available PO and/or Quote; a match
+  with either one passes, and at least one product line must match by
+  quantity and part number or partner SKU (not every line is required);
 - require **No** for question 6 wherever it appears in the EUS;
 - require a signer title of manager or higher;
 - validate the signer email format and require at least one document or
@@ -263,7 +272,17 @@ manual rerun is needed:
 - accept a clearly visible handwritten/electronic signature on a scanned EUS,
   or verify that an embedded PDF signature is cryptographically intact and
   valid. A visible signature is treated as present but is not falsely described
-  as cryptographically authenticated.
+  as cryptographically authenticated;
+- require the end-user name, address, and website, verify that the website
+  responds, and ask the AI whether the name, address, and website domain
+  describe a legitimate organisation.
+
+A new end user must pass every check. A repeat customer — an end user with an
+approved EUS in an earlier email — passes when at least 70% of the checks pass;
+the confidence score is shown in the review.
+
+Special instructions are shared with only the PO and Quote. The EUS is
+forwarded separately when it is approved, and sharing waits for that approval.
 
 Every check is shown as pass or fail. A reviewer can still override a failed or
 unverified automated result and approve manually. The extractor requires the

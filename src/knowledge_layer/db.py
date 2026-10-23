@@ -64,6 +64,22 @@ CREATE TABLE IF NOT EXISTS attachment_decisions (
     decided_at TEXT NOT NULL
 );
 
+-- Every downloaded EUS-tab document and its current review queue state.
+CREATE TABLE IF NOT EXISTS eus_documents (
+    relative_path TEXT PRIMARY KEY,
+    folder_name TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    document_type TEXT,
+    end_user_name TEXT,
+    review_status TEXT NOT NULL CHECK (
+        review_status IN ('active', 'approved', 'rejected')
+    ),
+    received_at TEXT NOT NULL,
+    decided_by TEXT,
+    decided_at TEXT,
+    updated_at TEXT NOT NULL
+);
+
 -- The authoritative content and metadata for downloaded mailbox attachments.
 CREATE TABLE IF NOT EXISTS mailbox_attachments (
     message_id TEXT NOT NULL,
@@ -204,6 +220,7 @@ def get_connection() -> Iterator[sqlite3.Connection]:
 # added on start, because CREATE TABLE IF NOT EXISTS leaves old tables unchanged.
 ADDED_COLUMNS = [
     ("orders", "ai_used", "INTEGER"),
+    ("eus_documents", "end_user_name", "TEXT"),
     ("orders", "approved_at", "TEXT"),
     ("orders", "missing_snapshot_count", "INTEGER NOT NULL DEFAULT 0"),
     ("all_orders", "uspo", "TEXT"),

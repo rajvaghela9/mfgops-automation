@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import Dict, Optional
 
+from src.knowledge_layer import eus_document_store
 from src.knowledge_layer.db import get_connection, init_db
 from src.utils.time_helpers import utc_now_iso
 
@@ -138,6 +139,7 @@ def record_decision(
             """,
             (attachment_path, decision, decided_by, comment, utc_now_iso()),
         )
+    eus_document_store.record_decision(attachment_path, decision, decided_by)
 
 
 def get_decision(attachment_path: str) -> Optional[Dict[str, str]]:

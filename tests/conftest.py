@@ -40,6 +40,12 @@ def isolated_environment(tmp_path, monkeypatch):
         "LITELLM_API_KEY",
         "LITELLM_MODEL",
         "BACKLOG_FILE_PATH",
+        # Tests must never reach the real Microsoft Graph mailbox.
+        "GRAPH_TENANT_ID",
+        "GRAPH_CLIENT_ID",
+        "GRAPH_CLIENT_SECRET",
+        "GRAPH_MAILBOX",
+        "GRAPH_SENDER_EMAILS",
         "GRAPH_API_TENANT_ID",
         "GRAPH_API_CLIENT_ID",
         "GRAPH_API_CLIENT_SECRET",
